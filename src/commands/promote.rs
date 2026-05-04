@@ -14,17 +14,13 @@ pub async fn run(args: PromoteArgs) -> Result<()> {
     let cfg = Config::load(&args.config)?;
     let target = cfg.target(&args.target)?;
     let key_spec = target.signing_key()?;
+    let key_id = target.signing_key_id()?;
     let store = object_store::from_endpoint(target)?;
     let manifest_bytes = store.get(&args.manifest_path).await?;
     let manifest: SignedManifest = serde_json::from_slice(&manifest_bytes)?;
     manifest.validate_schema()?;
     let manifest_sha256 = hashing::sha256_bytes(&manifest_bytes);
     let id = snapshot_id(manifest.body.height, &manifest.body.state_root);
-    let key_id = manifest
-        .signature
-        .as_ref()
-        .map(|s| s.key_id.clone())
-        .unwrap_or_else(|| "local-dev".to_string());
     let body = PointerBody {
         format: POINTER_FORMAT.to_string(),
         network: manifest.body.network,
@@ -38,7 +34,7 @@ pub async fn run(args: PromoteArgs) -> Result<()> {
         block_hash: manifest.body.block_hash,
         updated_at: Utc::now(),
     };
-    let signature = signing::sign_body(&body, &key_id, key_spec)?;
+    let signature = signing::sign_body(&body, key_id, key_spec)?;
     let pointer = SignedPointer { body, signature };
     pointer.validate_schema()?;
 

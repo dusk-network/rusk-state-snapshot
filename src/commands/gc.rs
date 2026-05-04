@@ -5,13 +5,14 @@ use crate::{
 use anyhow::Result;
 use chrono::Utc;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 #[derive(Debug, Serialize)]
 struct GcReport {
     generated_at: chrono::DateTime<Utc>,
     dry_run: bool,
     marked: Vec<String>,
+    prunable_pointers: Vec<String>,
     deletable: Vec<String>,
     deleted: Vec<String>,
 }
@@ -23,6 +24,8 @@ pub async fn run(args: GcArgs) -> Result<()> {
     let store = object_store::from_endpoint(target)?;
     let grace = policy.grace_period()?;
     let dry_run = if args.delete { false } else { true };
+
+    let prunable_pointers = prune_pointers(store.as_ref(), &policy, dry_run).await?;
 
     let mut marked = HashSet::new();
     for prefix in [
@@ -88,6 +91,7 @@ pub async fn run(args: GcArgs) -> Result<()> {
         generated_at: Utc::now(),
         dry_run,
         marked: marked_vec,
+        prunable_pointers,
         deletable,
         deleted,
     };
@@ -100,4 +104,57 @@ pub async fn run(args: GcArgs) -> Result<()> {
         .await?;
     println!("{report_path}");
     Ok(())
+}
+
+async fn prune_pointers(
+    store: &dyn object_store::ObjectStore,
+    policy: &RetentionPolicy,
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    let mut prunable = Vec::new();
+    if !policy.rolling.keep_latest && store.exists("v1/pointers/latest.json").await? {
+        prunable.push("v1/pointers/latest.json".to_string());
+    }
+    if !policy.rolling.keep_previous && store.exists("v1/pointers/previous.json").await? {
+        prunable.push("v1/pointers/previous.json".to_string());
+    }
+    prunable.extend(
+        prune_calendar_prefix(store, "v1/calendar/daily", policy.rolling.keep_daily).await?,
+    );
+    prunable.extend(
+        prune_calendar_prefix(store, "v1/calendar/monthly", policy.monthly.keep_months).await?,
+    );
+    if policy.yearly.keep_years > 0 {
+        prunable.extend(
+            prune_calendar_prefix(store, "v1/calendar/yearly", policy.yearly.keep_years).await?,
+        );
+    }
+    prunable.sort();
+    prunable.dedup();
+    if !dry_run {
+        for path in &prunable {
+            store.delete(path).await?;
+        }
+    }
+    Ok(prunable)
+}
+
+async fn prune_calendar_prefix(
+    store: &dyn object_store::ObjectStore,
+    prefix: &str,
+    keep: usize,
+) -> Result<Vec<String>> {
+    let mut dated: Vec<String> = store
+        .list_prefix(prefix)
+        .await?
+        .into_iter()
+        .filter(|meta| meta.path.ends_with(".json"))
+        .map(|meta| meta.path)
+        .collect();
+    dated.sort();
+    let keep_set: BTreeSet<String> = dated.iter().rev().take(keep).cloned().collect();
+    Ok(dated
+        .into_iter()
+        .filter(|path| !keep_set.contains(path))
+        .collect())
 }

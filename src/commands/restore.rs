@@ -17,8 +17,8 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
     let trust = cfg.trusted_for_endpoint(source)?;
     let store = object_store::from_endpoint(source)?;
 
-    let manifest_path = if let Some(path) = &args.manifest_path {
-        path.clone()
+    let (manifest_path, pointer) = if let Some(path) = &args.manifest_path {
+        (path.clone(), None)
     } else {
         let label = label_from_selector(
             args.latest,
@@ -39,7 +39,7 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
         if !trust.is_empty() {
             pointer.verify_signature(&trust)?;
         }
-        pointer.body.manifest_path
+        (pointer.body.manifest_path.clone(), Some(pointer))
     };
 
     let manifest_bytes = store.get(&manifest_path).await?;
@@ -48,6 +48,9 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
     manifest.validate_schema()?;
     if !trust.is_empty() || manifest.signature.is_some() {
         manifest.verify_signature(&trust)?;
+    }
+    if let Some(pointer) = &pointer {
+        verify_pointer_matches_manifest(pointer, &manifest, &manifest_hash)?;
     }
 
     let artifact = &manifest.body.artifacts[0];
@@ -63,8 +66,9 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
     fs::create_dir_all(&temp_parent)?;
     let temp = tempfile::tempdir_in(&temp_parent)?;
     let archive_path = temp.path().join("snapshot.tar.zst");
-    let artifact_bytes = store.get(&artifact_remote_path).await?;
-    fs::write(&archive_path, &artifact_bytes)?;
+    store
+        .get_to_file(&artifact_remote_path, &archive_path)
+        .await?;
     let hashes = hashing::hash_file(&archive_path)?;
     if hashes.size != artifact.size
         || hashes.sha256 != artifact.sha256
@@ -90,6 +94,29 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
         service_cmd("start", service)?;
     }
     println!("restored {} ({manifest_hash})", manifest.body.state_id);
+    Ok(())
+}
+
+fn verify_pointer_matches_manifest(
+    pointer: &SignedPointer,
+    manifest: &SignedManifest,
+    manifest_hash: &str,
+) -> Result<()> {
+    let id = crate::manifest::snapshot_id(manifest.body.height, &manifest.body.state_root);
+    if pointer.body.manifest_sha256 != manifest_hash {
+        bail!("pointer manifest_sha256 does not match fetched manifest");
+    }
+    if pointer.body.snapshot_id != id {
+        bail!("pointer snapshot_id does not match manifest");
+    }
+    if pointer.body.network != manifest.body.network
+        || pointer.body.role != manifest.body.role
+        || pointer.body.height != manifest.body.height
+        || pointer.body.state_root != manifest.body.state_root
+        || pointer.body.block_hash != manifest.body.block_hash
+    {
+        bail!("pointer metadata does not match manifest");
+    }
     Ok(())
 }
 

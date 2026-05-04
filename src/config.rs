@@ -21,6 +21,7 @@ pub enum Endpoint {
         #[serde(default)]
         trusted_keys: Vec<String>,
         signing_key: Option<String>,
+        signing_key_id: Option<String>,
     },
     Https {
         base_url: String,
@@ -33,11 +34,14 @@ pub enum Endpoint {
         bucket: String,
         #[serde(default)]
         prefix: String,
+        #[serde(default = "default_s3_region")]
+        region: String,
         access_key: String,
         secret_key: String,
         #[serde(default)]
         trusted_keys: Vec<String>,
         signing_key: Option<String>,
+        signing_key_id: Option<String>,
     },
 }
 
@@ -93,4 +97,19 @@ impl Endpoint {
             Endpoint::Https { .. } => bail!("https endpoint cannot be a signing target"),
         }
     }
+
+    pub fn signing_key_id(&self) -> Result<&str> {
+        match self {
+            Endpoint::File { signing_key_id, .. } | Endpoint::S3 { signing_key_id, .. } => {
+                signing_key_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("target has no signing_key_id configured"))
+            }
+            Endpoint::Https { .. } => bail!("https endpoint cannot be a signing target"),
+        }
+    }
+}
+
+fn default_s3_region() -> String {
+    "us-east-1".to_string()
 }

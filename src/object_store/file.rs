@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::{
     fs,
+    path::Path as StdPath,
     path::{Component, Path, PathBuf},
 };
 use walkdir::WalkDir;
@@ -47,8 +48,48 @@ impl ObjectStore for FileStore {
         fs::write(&full, bytes).with_context(|| format!("write object {}", full.display()))
     }
 
+    async fn get_to_file(&self, path: &str, destination: &StdPath) -> Result<()> {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(self.resolve(path)?, destination)?;
+        Ok(())
+    }
+
+    async fn put_file(&self, path: &str, source: &StdPath) -> Result<()> {
+        let full = self.resolve(path)?;
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, full)?;
+        Ok(())
+    }
+
+    async fn copy(&self, from: &str, to: &str) -> Result<()> {
+        let from = self.resolve(from)?;
+        let to = self.resolve(to)?;
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(from, to)?;
+        Ok(())
+    }
+
+    async fn stat(&self, path: &str) -> Result<Option<ObjectMeta>> {
+        let full = self.resolve(path)?;
+        if !full.exists() {
+            return Ok(None);
+        }
+        let meta = fs::metadata(&full)?;
+        Ok(Some(ObjectMeta {
+            path: path.to_string(),
+            size: meta.len(),
+            modified: meta.modified().ok().map(DateTime::<Utc>::from),
+        }))
+    }
+
     async fn exists(&self, path: &str) -> Result<bool> {
-        Ok(self.resolve(path)?.exists())
+        Ok(self.stat(path).await?.is_some())
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {

@@ -1,11 +1,13 @@
 use crate::{
     archive,
     cli::{GcArgs, PackArgs, PromoteArgs, PublishArgs, RestoreArgs, VerifyArgs},
-    commands, hashing,
+    commands,
+    config::Endpoint,
+    hashing,
     manifest::{
         Artifact, ComponentEntry, Components, ManifestBody, SignedManifest, MANIFEST_FORMAT,
     },
-    object_store::{file::FileStore, ObjectStore},
+    object_store::{file::FileStore, http, s3::S3Store, ObjectStore},
     pointer::{PointerBody, SignedPointer, POINTER_FORMAT},
     retention, safe_extract, signing,
 };
@@ -232,7 +234,7 @@ async fn local_object_store_and_publish_idempotency_conflict() {
     fs::write(
         &cfg,
         format!(
-            "[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\n",
+            "[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\nsigning_key_id='target-k1'\n",
             tmp.path().join("target").display(),
             SEED1
         ),
@@ -254,6 +256,12 @@ async fn local_object_store_and_publish_idempotency_conflict() {
     let final_manifest = tmp
         .path()
         .join("target/v1/snapshots/full/h000000001-sr_22222222/manifest.json");
+    let final_artifact = tmp
+        .path()
+        .join("target/v1/snapshots/full/h000000001-sr_22222222/snapshot.tar.zst");
+    let manifest_mtime = fs::metadata(&final_manifest).unwrap().modified().unwrap();
+    let artifact_mtime = fs::metadata(&final_artifact).unwrap().modified().unwrap();
+    assert!(manifest_mtime >= artifact_mtime);
     fs::write(&final_manifest, b"different").unwrap();
     assert!(commands::publish::run(PublishArgs {
         target: "local".to_string(),
@@ -273,7 +281,7 @@ async fn restore_verifies_before_replacing_and_keeps_backup() {
     fs::write(
         &pub_cfg,
         format!(
-            "[trust.k1]\nscheme='ed25519'\npublic_key='{public}'\n[source.local]\nkind='file'\npath='{}'\ntrusted_keys=['k1']\n[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\n",
+            "[trust.k1]\nscheme='ed25519'\npublic_key='{public}'\n[trust.target-k1]\nscheme='ed25519'\npublic_key='{public}'\n[source.local]\nkind='file'\npath='{}'\ntrusted_keys=['k1', 'target-k1']\n[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\nsigning_key_id='target-k1'\n",
             tmp.path().join("target").display(),
             tmp.path().join("target").display(),
             SEED1
@@ -296,12 +304,16 @@ async fn restore_verifies_before_replacing_and_keeps_backup() {
     })
     .await
     .unwrap();
+    let pointer_path = tmp.path().join("target/v1/pointers/latest.json");
+    let pointer: SignedPointer = serde_json::from_slice(&fs::read(&pointer_path).unwrap()).unwrap();
+    assert_eq!(pointer.signature.key_id, "target-k1");
+
     let dest = tmp.path().join("dest");
     make_profile(&dest);
     fs::write(dest.join("state/old"), b"old").unwrap();
     commands::restore::run(RestoreArgs {
         source: "local".to_string(),
-        config: pub_cfg,
+        config: pub_cfg.clone(),
         latest: true,
         monthly: None,
         daily: None,
@@ -317,6 +329,28 @@ async fn restore_verifies_before_replacing_and_keeps_backup() {
     assert!(dest.join("state/value").exists());
     assert!(dest.join("chain.db/value").exists());
     assert!(dest.join("backups").read_dir().unwrap().next().is_some());
+
+    let mut tampered = pointer;
+    tampered.body.manifest_sha256 = HASH2.to_string();
+    tampered.signature = signing::sign_body(&tampered.body, "target-k1", SEED1).unwrap();
+    fs::write(&pointer_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+    let before = fs::read(dest.join("state/state.id")).unwrap();
+    assert!(commands::restore::run(RestoreArgs {
+        source: "local".to_string(),
+        config: pub_cfg,
+        latest: true,
+        monthly: None,
+        daily: None,
+        yearly: None,
+        pin: None,
+        manifest_path: None,
+        destination_profile: dest.clone(),
+        manage_service: None,
+        owner: None,
+    })
+    .await
+    .is_err());
+    assert_eq!(fs::read(dest.join("state/state.id")).unwrap(), before);
 }
 
 #[tokio::test]
@@ -328,7 +362,7 @@ async fn gc_dry_run_and_delete_unreferenced_objects() {
     fs::write(
         &cfg,
         format!(
-            "[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\n",
+            "[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\nsigning_key_id='target-k1'\n",
             target.display(),
             SEED1
         ),
@@ -377,6 +411,113 @@ async fn gc_dry_run_and_delete_unreferenced_objects() {
     assert!(!target
         .join("v1/snapshots/full/old/snapshot.tar.zst")
         .exists());
+}
+
+#[tokio::test]
+async fn file_store_streaming_helpers_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FileStore::new(tmp.path().join("store"));
+    let source = tmp.path().join("large.bin");
+    fs::write(&source, vec![42u8; 1024 * 64]).unwrap();
+    store.put_file("v1/large.bin", &source).await.unwrap();
+    assert_eq!(
+        store.stat("v1/large.bin").await.unwrap().unwrap().size,
+        65536
+    );
+    let dest = tmp.path().join("out.bin");
+    store.get_to_file("v1/large.bin", &dest).await.unwrap();
+    assert_eq!(
+        hashing::hash_file(&source).unwrap(),
+        hashing::hash_file(&dest).unwrap()
+    );
+}
+
+#[test]
+fn s3_backend_builds_keys_under_custom_endpoint_prefix() {
+    let s3 = S3Store::new(Endpoint::S3 {
+        endpoint: "https://hel1.your-objectstorage.com".to_string(),
+        bucket: "operator-bucket".to_string(),
+        prefix: "v1".to_string(),
+        region: "hel1".to_string(),
+        access_key: "access".to_string(),
+        secret_key: "secret".to_string(),
+        trusted_keys: vec![],
+        signing_key: None,
+        signing_key_id: None,
+    })
+    .unwrap();
+    assert_eq!(
+        s3.object_key("v1/snapshots/full/h000000001-sr_11111111/manifest.json")
+            .unwrap(),
+        "v1/snapshots/full/h000000001-sr_11111111/manifest.json"
+    );
+}
+
+#[test]
+fn http_index_lists_prefix_without_store_listing() {
+    let index = br#"{
+      "format": "rusk-state-snapshot-index/v1",
+      "objects": [
+        {"path":"v1/pointers/latest.json","size":10},
+        {"path":"v1/calendar/monthly/2026-05.json","size":20},
+        {"path":"v1/snapshots/full/h000000001-sr_11111111/manifest.json","size":30}
+      ]
+    }"#;
+    let monthly = http::list_from_index_bytes("v1/calendar/monthly", index).unwrap();
+    assert_eq!(monthly.len(), 1);
+    assert_eq!(monthly[0].path, "v1/calendar/monthly/2026-05.json");
+}
+
+#[tokio::test]
+async fn gc_prunes_calendar_pointers_before_reachability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("target");
+    let cfg = tmp.path().join("config.toml");
+    fs::write(
+        &cfg,
+        format!(
+            "[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\nsigning_key_id='target-k1'\n",
+            target.display(),
+            SEED1
+        ),
+    )
+    .unwrap();
+    for day in 1..=6 {
+        let path = target.join(format!("v1/calendar/daily/2026-05-0{day}.json"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"{}").unwrap();
+    }
+    for month in 1..=13 {
+        let path = target.join(format!("v1/calendar/monthly/2026-{month:02}.json"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"{}").unwrap();
+    }
+    for year in 2024..=2026 {
+        let path = target.join(format!("v1/calendar/yearly/{year}.json"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"{}").unwrap();
+    }
+    let policy = tmp.path().join("retention.toml");
+    fs::write(
+        &policy,
+        "[rolling]\nkeep_latest=true\nkeep_previous=true\nkeep_daily=5\n[monthly]\nkeep_months=12\nselection='last-good-daily-of-month'\n[yearly]\nkeep_years=1\nselection='december-monthly'\n[gc]\ndelete_grace_period='0s'\ndry_run_default=true\n",
+    )
+    .unwrap();
+    commands::gc::run(GcArgs {
+        target: "local".to_string(),
+        config: cfg,
+        policy,
+        dry_run: false,
+        delete: true,
+    })
+    .await
+    .unwrap();
+    assert!(!target.join("v1/calendar/daily/2026-05-01.json").exists());
+    assert!(target.join("v1/calendar/daily/2026-05-06.json").exists());
+    assert!(!target.join("v1/calendar/monthly/2026-01.json").exists());
+    assert!(target.join("v1/calendar/monthly/2026-13.json").exists());
+    assert!(!target.join("v1/calendar/yearly/2024.json").exists());
+    assert!(target.join("v1/calendar/yearly/2026.json").exists());
 }
 
 #[test]

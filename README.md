@@ -92,24 +92,52 @@ components, and symlinks that escape the extraction root.
 
 Sources are read-only discovery locations. Targets are writable publishing
 locations. Both are configured in TOML. The local filesystem backend is fully
-implemented and tested. HTTP sources support direct object fetches. The S3
-backend is factored behind the same object-store trait with custom endpoint
-configuration in place; live S3 tests are intentionally not required.
+implemented and tested. HTTP sources support direct object fetches and public
+listing through an `index.json` file. The S3 backend uses AWS Signature V4
+against configurable S3-compatible endpoints, buckets, prefixes, and regions,
+including Hetzner-style object storage.
+
+Targets that promote pointers must configure both `signing_key` and
+`signing_key_id`. Pointer signatures use the target key id, not the manifest
+publisher key id, so operators can publish manifests and retention labels with
+separate keys.
+
+HTTP sources that do not allow bucket listing can publish an index at
+`<base_url>/index.json`:
+
+```json
+{
+  "format": "rusk-state-snapshot-index/v1",
+  "objects": [
+    {
+      "path": "v1/pointers/latest.json",
+      "size": 767
+    },
+    {
+      "path": "v1/snapshots/full/h000000001-sr_11111111/manifest.json",
+      "size": 989
+    }
+  ]
+}
+```
 
 ## Restore Safety
 
-Restore downloads and verifies the pointer, manifest, artifact hashes, archive
-paths, and `state/state.id` before touching the destination profile. It moves
-existing `state` and `chain.db` into a timestamped backup directory, then moves
-the verified replacement into place. It never deletes live node state before
-verification.
+Restore downloads and verifies the pointer, pointer-to-manifest hash and
+metadata, manifest signature, artifact hashes, archive paths, and
+`state/state.id` before touching the destination profile. Artifact downloads use
+file-based object-store operations so large archives are not buffered in memory.
+It moves existing `state` and `chain.db` into a timestamped backup directory,
+then moves the verified replacement into place. It never deletes live node state
+before verification.
 
 ## GC Safety
 
-`gc` is snapshot-object eviction only. It loads pointers, marks reachable
-manifests and artifacts, reports unreferenced snapshot/staging objects older
-than the grace period, and deletes them only with `--delete`. It never touches
-local node state.
+`gc` is snapshot-object eviction only. It first prunes daily/monthly/yearly
+pointer labels according to the retention policy, then loads remaining pointers,
+marks reachable manifests and artifacts, reports unreferenced snapshot/staging
+objects older than the grace period, and deletes them only with `--delete`. It
+never touches local node state.
 
 ## No Runtime Integration
 
