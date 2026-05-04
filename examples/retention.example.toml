@@ -1,0 +1,16 @@
+[rolling]
+keep_latest = true
+keep_previous = true
+keep_daily = 5
+
+[monthly]
+keep_months = 12
+selection = "last-good-daily-of-month"
+
+[yearly]
+keep_years = 0
+selection = "december-monthly"
+
+[gc]
+delete_grace_period = "7d"
+dry_run_default = true

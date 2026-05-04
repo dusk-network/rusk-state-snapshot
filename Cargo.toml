@@ -1,0 +1,35 @@
+[package]
+name = "rusk-state-snapshot"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Standalone signed Dusk/Rusk state snapshot distribution CLI"
+
+[[bin]]
+name = "rusk-state-snapshot"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+blake3 = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+ed25519-compact = "2"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "process"] }
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+zstd = "0.13"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"

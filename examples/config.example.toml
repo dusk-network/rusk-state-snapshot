@@ -1,0 +1,33 @@
+# Local development configuration. The inline signing key is a deterministic
+# dummy seed for exercising the CLI only; do not use it for published snapshots.
+
+[source.local_mainnet]
+kind = "file"
+path = "./target/rusk-state-snapshot-store"
+trusted_keys = []
+
+[target.local_mainnet]
+kind = "file"
+path = "./target/rusk-state-snapshot-store"
+signing_key = "0101010101010101010101010101010101010101010101010101010101010101"
+
+# Example shape for a configured public source. Fill in real trust keys and URL.
+[source.dusk_mainnet]
+kind = "https"
+base_url = "https://example.invalid/mainnet/v1"
+trusted_keys = ["dusk_mainnet_2026"]
+
+[trust.dusk_mainnet_2026]
+scheme = "ed25519"
+public_key = "0000000000000000000000000000000000000000000000000000000000000000"
+
+# Example S3-compatible target shape. Values are placeholders and are not used
+# by tests; keep credentials in environment variables or files.
+[target.s3_example]
+kind = "s3"
+endpoint = "https://example-s3-compatible-endpoint"
+bucket = "operator-owned-bucket"
+prefix = "v1"
+access_key = "env:RUSK_STATE_SNAPSHOT_S3_ACCESS_KEY"
+secret_key = "env:RUSK_STATE_SNAPSHOT_S3_SECRET_KEY"
+signing_key = "file:/etc/rusk-state-snapshot/operator-signing-key"
