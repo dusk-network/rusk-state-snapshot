@@ -34,3 +34,7 @@ access_key = "env:RUSK_STATE_SNAPSHOT_S3_ACCESS_KEY"
 secret_key = "env:RUSK_STATE_SNAPSHOT_S3_SECRET_KEY"
 signing_key = "file:/etc/rusk-state-snapshot/operator-signing-key"
 signing_key_id = "operator-mainnet-2026"
+# Files at or above multipart_threshold are uploaded with multipart upload.
+# Defaults: 64 MiB threshold, 16 MiB parts. The S3 minimum part size is 5 MiB.
+multipart_threshold = 67108864
+multipart_part_size = 16777216

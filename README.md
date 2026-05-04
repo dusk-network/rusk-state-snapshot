@@ -73,6 +73,12 @@ cargo run -- gc \
   --dry-run
 ```
 
+```sh
+cargo run -- rebuild-index \
+  --config ./examples/config.example.toml \
+  --target local_mainnet
+```
+
 ## Scope
 
 Version 0 packs full provisioner snapshots only. The archive includes:
@@ -95,7 +101,21 @@ locations. Both are configured in TOML. The local filesystem backend is fully
 implemented and tested. HTTP sources support direct object fetches and public
 listing through an `index.json` file. The S3 backend uses AWS Signature V4
 against configurable S3-compatible endpoints, buckets, prefixes, and regions,
-including Hetzner-style object storage.
+including Hetzner-style object storage. Uploads larger than
+`multipart_threshold` (default 64 MiB) are sent as multipart uploads with
+configurable `multipart_part_size` (default 16 MiB, S3 minimum 5 MiB) and
+fall back to AbortMultipartUpload on error. `ListObjectsV2` pagination uses
+continuation tokens so listings are not silently truncated at 1 000 keys.
+
+Publishes upload the snapshot artifact directly to its final immutable key and
+write the manifest last. This avoids server-side single-PUT copy (capped at
+5 GiB on AWS S3 and many providers) and guarantees that no manifest ever
+references a partial or missing artifact. Promotions verify the referenced
+manifest's signature against the target's `trusted_keys` (mandatorily, with
+`--require-signed-manifest`) and confirm the referenced artifact exists at the
+expected size before any pointer is written. The `previous` pointer is
+regenerated as a freshly signed pointer with `label = "previous"` rather than
+byte-copied from `latest.json`.
 
 Targets that promote pointers must configure both `signing_key` and
 `signing_key_id`. Pointer signatures use the target key id, not the manifest

@@ -28,6 +28,7 @@ pub trait ObjectStore: Send + Sync {
     async fn put_file(&self, path: &str, source: &Path) -> Result<()> {
         self.put(path, &tokio::fs::read(source).await?).await
     }
+    #[allow(dead_code)]
     async fn copy(&self, from: &str, to: &str) -> Result<()> {
         let bytes = self.get(from).await?;
         self.put(to, &bytes).await

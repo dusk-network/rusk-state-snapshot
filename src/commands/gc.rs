@@ -23,9 +23,21 @@ pub async fn run(args: GcArgs) -> Result<()> {
     let target = cfg.target(&args.target)?;
     let store = object_store::from_endpoint(target)?;
     let grace = policy.grace_period()?;
-    let dry_run = if args.delete { false } else { true };
+    // --delete is the only way to actually mutate state; otherwise we run as
+    // a dry run regardless of whether --dry-run was passed.
+    let dry_run = !args.delete;
 
-    let prunable_pointers = prune_pointers(store.as_ref(), &policy, dry_run).await?;
+    // Compute the set of pointers that retention would prune. On a real run
+    // we delete them up-front. On a dry run we DON'T delete, but we still
+    // exclude them from reachability marking so the report accurately
+    // reflects what `--delete` would later remove.
+    let prunable_pointers = simulate_prune_pointers(store.as_ref(), &policy).await?;
+    if !dry_run {
+        for path in &prunable_pointers {
+            store.delete(path).await?;
+        }
+    }
+    let pruned: HashSet<&str> = prunable_pointers.iter().map(|s| s.as_str()).collect();
 
     let mut marked = HashSet::new();
     for prefix in [
@@ -37,6 +49,12 @@ pub async fn run(args: GcArgs) -> Result<()> {
     ] {
         for meta in store.list_prefix(prefix).await? {
             if !meta.path.ends_with(".json") {
+                continue;
+            }
+            // Skip pointers we just simulated/performed pruning of so that
+            // their referenced manifests/artifacts aren't kept alive on a
+            // dry run.
+            if pruned.contains(meta.path.as_str()) {
                 continue;
             }
             marked.insert(meta.path.clone());
@@ -106,10 +124,11 @@ pub async fn run(args: GcArgs) -> Result<()> {
     Ok(())
 }
 
-async fn prune_pointers(
+/// Compute the set of pointer object paths that retention policy would prune.
+/// This is a side-effect-free simulation; callers decide whether to apply it.
+pub async fn simulate_prune_pointers(
     store: &dyn object_store::ObjectStore,
     policy: &RetentionPolicy,
-    dry_run: bool,
 ) -> Result<Vec<String>> {
     let mut prunable = Vec::new();
     if !policy.rolling.keep_latest && store.exists("v1/pointers/latest.json").await? {
@@ -131,11 +150,6 @@ async fn prune_pointers(
     }
     prunable.sort();
     prunable.dedup();
-    if !dry_run {
-        for path in &prunable {
-            store.delete(path).await?;
-        }
-    }
     Ok(prunable)
 }
 

@@ -1,6 +1,8 @@
 use crate::{cli::VerifyArgs, config::Config, hashing, manifest::SignedManifest, safe_extract};
 use anyhow::{bail, Context, Result};
+use futures_util::StreamExt;
 use std::{collections::HashMap, fs, path::PathBuf};
+use tokio::io::AsyncWriteExt;
 
 pub async fn run(args: VerifyArgs) -> Result<()> {
     if args.manifest.starts_with("http://") || args.manifest.starts_with("https://") {
@@ -18,7 +20,14 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
 
 async fn verify_remote(args: VerifyArgs) -> Result<()> {
     let manifest_url = args.manifest.clone();
-    let bytes = reqwest::get(&manifest_url).await?.bytes().await?.to_vec();
+    let manifest_res = reqwest::get(&manifest_url).await?;
+    if !manifest_res.status().is_success() {
+        bail!(
+            "fetch {manifest_url} failed with {}",
+            manifest_res.status()
+        );
+    }
+    let bytes = manifest_res.bytes().await?.to_vec();
     let manifest: SignedManifest = serde_json::from_slice(&bytes)?;
     let artifact = manifest
         .body
@@ -30,11 +39,26 @@ async fn verify_remote(args: VerifyArgs) -> Result<()> {
         .map(|(base, _)| base)
         .ok_or_else(|| anyhow::anyhow!("invalid manifest URL"))?;
     let artifact_url = format!("{base}/{}", artifact.path);
-    let artifact_bytes = reqwest::get(&artifact_url).await?.bytes().await?.to_vec();
     let tmp = tempfile::tempdir()?;
     let manifest_path = tmp.path().join("manifest.json");
     fs::write(&manifest_path, &bytes)?;
-    fs::write(tmp.path().join(&artifact.path), artifact_bytes)?;
+
+    // Stream the artifact to a temp file rather than buffering the entire
+    // archive in memory. Production artifacts can be many gigabytes.
+    let artifact_path = tmp.path().join(&artifact.path);
+    let res = reqwest::get(&artifact_url).await?;
+    if !res.status().is_success() {
+        bail!("fetch {artifact_url} failed with {}", res.status());
+    }
+    {
+        let mut file = tokio::fs::File::create(&artifact_path).await?;
+        let mut stream = res.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            file.write_all(&chunk?).await?;
+        }
+        file.flush().await?;
+    }
+
     verify_manifest_local(&manifest, &manifest_path, args).await?;
     println!("verified {manifest_url}");
     Ok(())

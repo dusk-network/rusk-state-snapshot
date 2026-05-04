@@ -1,13 +1,18 @@
 use crate::{
     archive,
-    cli::{GcArgs, PackArgs, PromoteArgs, PublishArgs, RestoreArgs, VerifyArgs},
+    cli::{GcArgs, PackArgs, PromoteArgs, PublishArgs, RebuildIndexArgs, RestoreArgs, VerifyArgs},
     commands,
     config::Endpoint,
     hashing,
     manifest::{
         Artifact, ComponentEntry, Components, ManifestBody, SignedManifest, MANIFEST_FORMAT,
     },
-    object_store::{file::FileStore, http, s3::S3Store, ObjectStore},
+    object_store::{
+        file::FileStore,
+        http,
+        s3::{self, S3Store, UploadPlan},
+        ObjectStore,
+    },
     pointer::{PointerBody, SignedPointer, POINTER_FORMAT},
     retention, safe_extract, signing,
 };
@@ -301,6 +306,7 @@ async fn restore_verifies_before_replacing_and_keeps_backup() {
         manifest_path: "v1/snapshots/full/h000000001-sr_22222222/manifest.json".to_string(),
         label: "latest".to_string(),
         update_previous: true,
+        require_signed_manifest: false,
     })
     .await
     .unwrap();
@@ -444,6 +450,8 @@ fn s3_backend_builds_keys_under_custom_endpoint_prefix() {
         trusted_keys: vec![],
         signing_key: None,
         signing_key_id: None,
+        multipart_threshold: None,
+        multipart_part_size: None,
     })
     .unwrap();
     assert_eq!(
@@ -535,3 +543,524 @@ fn retention_duration_parses() {
     assert!(kept.contains("2026-05-04"));
     assert!(kept.contains("2026-05-03"));
 }
+
+// ---------------------------------------------------------------------------
+// Multipart decision logic
+// ---------------------------------------------------------------------------
+
+fn test_s3(threshold: Option<u64>, part_size: Option<u64>) -> S3Store {
+    S3Store::new(Endpoint::S3 {
+        endpoint: "https://hel1.your-objectstorage.com".to_string(),
+        bucket: "operator-bucket".to_string(),
+        prefix: "v1".to_string(),
+        region: "hel1".to_string(),
+        access_key: "access".to_string(),
+        secret_key: "secret".to_string(),
+        trusted_keys: vec![],
+        signing_key: None,
+        signing_key_id: None,
+        multipart_threshold: threshold,
+        multipart_part_size: part_size,
+    })
+    .unwrap()
+}
+
+#[test]
+fn s3_upload_plan_below_threshold_is_single_put() {
+    let store = test_s3(Some(64 * 1024 * 1024), Some(16 * 1024 * 1024));
+    assert_eq!(
+        store.upload_plan(10 * 1024 * 1024),
+        UploadPlan::Single {
+            size: 10 * 1024 * 1024
+        }
+    );
+}
+
+#[test]
+fn s3_upload_plan_above_threshold_is_multipart_with_correct_parts() {
+    let store = test_s3(Some(64 * 1024 * 1024), Some(16 * 1024 * 1024));
+    // 100 MiB with 16 MiB parts: ceil(100/16) = 7 parts.
+    let plan = store.upload_plan(100 * 1024 * 1024);
+    match plan {
+        UploadPlan::Multipart {
+            size,
+            part_size,
+            parts,
+        } => {
+            assert_eq!(size, 100 * 1024 * 1024);
+            assert_eq!(part_size, 16 * 1024 * 1024);
+            assert_eq!(parts, 7);
+        }
+        other => panic!("expected multipart, got {other:?}"),
+    }
+}
+
+#[test]
+fn s3_upload_plan_grows_part_size_when_part_count_would_exceed_10000() {
+    // Force tiny part size that would otherwise produce far too many parts.
+    let store = test_s3(Some(5 * 1024 * 1024), Some(s3::S3_MIN_PART_SIZE));
+    // 200 GiB at 5 MiB parts is ~40,960 parts; planner must enlarge parts.
+    let size = 200u64 * 1024 * 1024 * 1024;
+    let plan = store.upload_plan(size);
+    match plan {
+        UploadPlan::Multipart {
+            size: planned_size,
+            part_size,
+            parts,
+        } => {
+            assert_eq!(planned_size, size);
+            assert!(parts <= s3::S3_MAX_PARTS, "got {parts} parts");
+            assert!(part_size >= s3::S3_MIN_PART_SIZE);
+            assert!(part_size * parts >= size);
+        }
+        other => panic!("expected multipart, got {other:?}"),
+    }
+}
+
+#[test]
+fn s3_construction_rejects_part_size_below_5_mib() {
+    let err = S3Store::new(Endpoint::S3 {
+        endpoint: "https://example.invalid".to_string(),
+        bucket: "b".to_string(),
+        prefix: String::new(),
+        region: "r".to_string(),
+        access_key: "a".to_string(),
+        secret_key: "s".to_string(),
+        trusted_keys: vec![],
+        signing_key: None,
+        signing_key_id: None,
+        multipart_threshold: None,
+        multipart_part_size: Some(1024 * 1024),
+    })
+    .err()
+    .expect("must reject sub-5MiB part size");
+    assert!(err.to_string().contains("multipart_part_size"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// S3 ListObjectsV2 pagination parsing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s3_list_pagination_parses_truncated_and_final_pages() {
+    let truncated = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>opaque-token-1</NextContinuationToken>
+  <Contents><Key>v1/snapshots/full/a/manifest.json</Key><Size>10</Size></Contents>
+  <Contents><Key>v1/snapshots/full/a/snapshot.tar.zst</Key><Size>20</Size></Contents>
+</ListBucketResult>"#;
+    let (entries, next) = s3::parse_list_page(truncated);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].0, "v1/snapshots/full/a/manifest.json");
+    assert_eq!(entries[0].1, 10);
+    assert_eq!(next.as_deref(), Some("opaque-token-1"));
+
+    let final_page = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <IsTruncated>false</IsTruncated>
+  <Contents><Key>v1/snapshots/full/b/manifest.json</Key><Size>30</Size></Contents>
+</ListBucketResult>"#;
+    let (entries, next) = s3::parse_list_page(final_page);
+    assert_eq!(entries.len(), 1);
+    assert!(next.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// GC dry-run pointer prune simulation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn gc_dry_run_excludes_simulated_pruned_pointers_from_reachability() {
+    // If retention would prune a daily pointer, dry-run must NOT keep that
+    // pointer's manifest/artifact alive in the report. Otherwise operators
+    // would think the artifact was protected when in fact a real run would
+    // delete it next.
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest_path = pack_candidate(&tmp, true).await;
+    let cfg = tmp.path().join("config.toml");
+    let target = tmp.path().join("target");
+    fs::write(
+        &cfg,
+        format!(
+            "[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\nsigning_key_id='target-k1'\n",
+            target.display(),
+            SEED1
+        ),
+    )
+    .unwrap();
+    commands::publish::run(PublishArgs {
+        target: "local".to_string(),
+        config: cfg.clone(),
+        manifest: manifest_path,
+    })
+    .await
+    .unwrap();
+    // Promote latest so the snapshot becomes reachable via a real pointer.
+    commands::promote::run(PromoteArgs {
+        target: "local".to_string(),
+        config: cfg.clone(),
+        manifest_path: "v1/snapshots/full/h000000001-sr_22222222/manifest.json".to_string(),
+        label: "latest".to_string(),
+        update_previous: false,
+        require_signed_manifest: false,
+    })
+    .await
+    .unwrap();
+    // Create extra daily calendar pointers older than what retention keeps.
+    for day in 1..=4 {
+        let path = target.join(format!("v1/calendar/daily/2026-05-0{day}.json"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"{}").unwrap();
+    }
+    // Policy keeps only 2 dailies: the older 2 should appear as prunable.
+    let policy = tmp.path().join("retention.toml");
+    fs::write(
+        &policy,
+        "[rolling]\nkeep_latest=true\nkeep_previous=true\nkeep_daily=2\n[monthly]\nkeep_months=12\nselection='last-good-daily-of-month'\n[yearly]\nkeep_years=0\nselection='december-monthly'\n[gc]\ndelete_grace_period='0s'\ndry_run_default=true\n",
+    )
+    .unwrap();
+    commands::gc::run(GcArgs {
+        target: "local".to_string(),
+        config: cfg.clone(),
+        policy: policy.clone(),
+        dry_run: true,
+        delete: false,
+    })
+    .await
+    .unwrap();
+
+    // Find the dry-run report and confirm the pruned dailies appear in
+    // prunable_pointers and are NOT present in marked.
+    let mut report_path = None;
+    for entry in fs::read_dir(target.join("v1/gc/reports")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().extension().and_then(|s| s.to_str()) == Some("json") {
+            report_path = Some(entry.path());
+        }
+    }
+    let report_path = report_path.expect("gc report must be written");
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+    assert_eq!(report["dry_run"], serde_json::Value::Bool(true));
+    let prunable: Vec<String> = report["prunable_pointers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    let marked: Vec<String> = report["marked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(prunable
+        .iter()
+        .any(|p| p == "v1/calendar/daily/2026-05-01.json"));
+    for pruned in &prunable {
+        assert!(
+            !marked.contains(pruned),
+            "marked must not include simulated-pruned pointer {pruned}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Index rebuild
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rebuild_index_lists_all_v1_objects_and_excludes_self() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest_path = pack_candidate(&tmp, true).await;
+    let cfg = tmp.path().join("config.toml");
+    let target = tmp.path().join("target");
+    fs::write(
+        &cfg,
+        format!(
+            "[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\nsigning_key_id='target-k1'\n",
+            target.display(),
+            SEED1
+        ),
+    )
+    .unwrap();
+    commands::publish::run(PublishArgs {
+        target: "local".to_string(),
+        config: cfg.clone(),
+        manifest: manifest_path,
+    })
+    .await
+    .unwrap();
+    commands::promote::run(PromoteArgs {
+        target: "local".to_string(),
+        config: cfg.clone(),
+        manifest_path: "v1/snapshots/full/h000000001-sr_22222222/manifest.json".to_string(),
+        label: "latest".to_string(),
+        update_previous: false,
+        require_signed_manifest: false,
+    })
+    .await
+    .unwrap();
+    commands::index::run(RebuildIndexArgs {
+        target: "local".to_string(),
+        config: cfg.clone(),
+    })
+    .await
+    .unwrap();
+    let index_bytes = fs::read(target.join("v1/index.json")).unwrap();
+    let index: serde_json::Value = serde_json::from_slice(&index_bytes).unwrap();
+    assert_eq!(index["format"], "rusk-state-snapshot-index/v1");
+    let paths: Vec<String> = index["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["path"].as_str().unwrap().to_string())
+        .collect();
+    assert!(paths.contains(&"v1/pointers/latest.json".to_string()));
+    assert!(paths.contains(
+        &"v1/snapshots/full/h000000001-sr_22222222/manifest.json".to_string()
+    ));
+    assert!(paths.contains(
+        &"v1/snapshots/full/h000000001-sr_22222222/snapshot.tar.zst".to_string()
+    ));
+    // The index never describes itself.
+    assert!(!paths.contains(&"v1/index.json".to_string()));
+    // Sizes are recorded.
+    let manifest_entry = index["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["path"] == "v1/pointers/latest.json")
+        .unwrap();
+    assert!(manifest_entry["size"].as_u64().unwrap() > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Promote artifact validation + signed-manifest requirement
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn promote_requires_signed_manifest_and_artifact_existence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest_path = pack_candidate(&tmp, true).await;
+    let cfg = tmp.path().join("config.toml");
+    let target = tmp.path().join("target");
+    let public = signing::public_key_from_secret_spec(SEED1).unwrap();
+    fs::write(
+        &cfg,
+        format!(
+            "[trust.k1]\nscheme='ed25519'\npublic_key='{public}'\n[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\nsigning_key_id='target-k1'\ntrusted_keys=['k1']\n",
+            target.display(),
+            SEED1
+        ),
+    )
+    .unwrap();
+    commands::publish::run(PublishArgs {
+        target: "local".to_string(),
+        config: cfg.clone(),
+        manifest: manifest_path,
+    })
+    .await
+    .unwrap();
+    // Happy path: signed manifest, artifact exists at correct size.
+    commands::promote::run(PromoteArgs {
+        target: "local".to_string(),
+        config: cfg.clone(),
+        manifest_path: "v1/snapshots/full/h000000001-sr_22222222/manifest.json".to_string(),
+        label: "latest".to_string(),
+        update_previous: false,
+        require_signed_manifest: true,
+    })
+    .await
+    .unwrap();
+
+    // Tamper: shrink the artifact so its size no longer matches the manifest.
+    let artifact = target.join("v1/snapshots/full/h000000001-sr_22222222/snapshot.tar.zst");
+    fs::write(&artifact, b"truncated").unwrap();
+    let err = commands::promote::run(PromoteArgs {
+        target: "local".to_string(),
+        config: cfg.clone(),
+        manifest_path: "v1/snapshots/full/h000000001-sr_22222222/manifest.json".to_string(),
+        label: "latest".to_string(),
+        update_previous: false,
+        require_signed_manifest: true,
+    })
+    .await
+    .err()
+    .expect("must reject promotion when artifact size differs from manifest");
+    assert!(err.to_string().contains("size mismatch"), "{err}");
+
+    // Remove the artifact entirely.
+    fs::remove_file(&artifact).unwrap();
+    let err = commands::promote::run(PromoteArgs {
+        target: "local".to_string(),
+        config: cfg.clone(),
+        manifest_path: "v1/snapshots/full/h000000001-sr_22222222/manifest.json".to_string(),
+        label: "latest".to_string(),
+        update_previous: false,
+        require_signed_manifest: true,
+    })
+    .await
+    .err()
+    .expect("must reject promotion when artifact is missing");
+    assert!(err.to_string().contains("missing"), "{err}");
+}
+
+#[tokio::test]
+async fn promote_rejects_unsigned_manifest_when_required() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Pack WITHOUT signing.
+    let manifest_path = pack_candidate(&tmp, false).await;
+    let cfg = tmp.path().join("config.toml");
+    let target = tmp.path().join("target");
+    let public = signing::public_key_from_secret_spec(SEED1).unwrap();
+    fs::write(
+        &cfg,
+        format!(
+            "[trust.k1]\nscheme='ed25519'\npublic_key='{public}'\n[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\nsigning_key_id='target-k1'\ntrusted_keys=['k1']\n",
+            target.display(),
+            SEED1
+        ),
+    )
+    .unwrap();
+    commands::publish::run(PublishArgs {
+        target: "local".to_string(),
+        config: cfg.clone(),
+        manifest: manifest_path,
+    })
+    .await
+    .unwrap();
+    let err = commands::promote::run(PromoteArgs {
+        target: "local".to_string(),
+        config: cfg,
+        manifest_path: "v1/snapshots/full/h000000001-sr_22222222/manifest.json".to_string(),
+        label: "latest".to_string(),
+        update_previous: false,
+        require_signed_manifest: true,
+    })
+    .await
+    .err()
+    .expect("unsigned manifest must be rejected when required");
+    assert!(err.to_string().contains("unsigned"), "{err}");
+}
+
+#[tokio::test]
+async fn promote_writes_freshly_signed_previous_pointer_with_correct_label() {
+    // The "previous" pointer must not be a byte-for-byte copy of the previous
+    // "latest". Its body must say label="previous" and carry a new signature.
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest_path = pack_candidate(&tmp, true).await;
+    let cfg = tmp.path().join("config.toml");
+    let target = tmp.path().join("target");
+    let public = signing::public_key_from_secret_spec(SEED1).unwrap();
+    fs::write(
+        &cfg,
+        format!(
+            "[trust.target-k1]\nscheme='ed25519'\npublic_key='{public}'\n[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\nsigning_key_id='target-k1'\n",
+            target.display(),
+            SEED1
+        ),
+    )
+    .unwrap();
+    commands::publish::run(PublishArgs {
+        target: "local".to_string(),
+        config: cfg.clone(),
+        manifest: manifest_path,
+    })
+    .await
+    .unwrap();
+    commands::promote::run(PromoteArgs {
+        target: "local".to_string(),
+        config: cfg.clone(),
+        manifest_path: "v1/snapshots/full/h000000001-sr_22222222/manifest.json".to_string(),
+        label: "latest".to_string(),
+        update_previous: true,
+        require_signed_manifest: false,
+    })
+    .await
+    .unwrap();
+    // First promotion: no prior latest -> no previous file.
+    assert!(!target.join("v1/pointers/previous.json").exists());
+
+    // Second promotion: previous.json must now exist as a freshly signed
+    // pointer body with label="previous".
+    commands::promote::run(PromoteArgs {
+        target: "local".to_string(),
+        config: cfg,
+        manifest_path: "v1/snapshots/full/h000000001-sr_22222222/manifest.json".to_string(),
+        label: "latest".to_string(),
+        update_previous: true,
+        require_signed_manifest: false,
+    })
+    .await
+    .unwrap();
+    let previous_bytes = fs::read(target.join("v1/pointers/previous.json")).unwrap();
+    let previous: SignedPointer = serde_json::from_slice(&previous_bytes).unwrap();
+    assert_eq!(previous.body.label, "previous");
+    assert_eq!(previous.signature.key_id, "target-k1");
+    let mut trust = std::collections::HashMap::new();
+    trust.insert(
+        "target-k1".to_string(),
+        signing::TrustKey {
+            scheme: "ed25519".to_string(),
+            public_key: public,
+        },
+    );
+    previous.verify_signature(&trust).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Remote verify streams to disk
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn remote_verify_streams_artifact_to_temp_file() {
+    use std::net::SocketAddr;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    // Build a manifest for an archive whose hashes we'll serve verbatim. We
+    // pack unsigned so verification doesn't require trust setup; the test is
+    // about streaming the artifact body to disk, not about signatures.
+    let tmp = tempfile::tempdir().unwrap();
+    let candidate = pack_candidate(&tmp, false).await;
+    let candidate_dir = candidate.parent().unwrap();
+    let manifest_bytes = fs::read(&candidate).unwrap();
+    let artifact_bytes = fs::read(candidate_dir.join("snapshot.tar.zst")).unwrap();
+
+    // Spin a tiny one-shot HTTP/1.1 server that serves manifest then archive.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let server_manifest = manifest_bytes.clone();
+    let server_artifact = artifact_bytes.clone();
+    let server = tokio::spawn(async move {
+        for body in [server_manifest, server_artifact] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            use tokio::io::AsyncWriteExt;
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+            socket.shutdown().await.ok();
+        }
+    });
+
+    let manifest_url = format!("http://{addr}/manifest.json");
+    commands::verify::run(VerifyArgs {
+        manifest: manifest_url,
+        config: None,
+        trusted_key: vec![],
+        require_signature: false,
+        network: Some("mainnet".to_string()),
+        role: Some("provisioner".to_string()),
+    })
+    .await
+    .unwrap();
+    server.await.unwrap();
+}
+

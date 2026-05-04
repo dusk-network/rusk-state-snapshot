@@ -18,6 +18,7 @@ pub enum Command {
     List(ListArgs),
     Restore(RestoreArgs),
     Gc(GcArgs),
+    RebuildIndex(RebuildIndexArgs),
 }
 
 #[derive(Debug, Args)]
@@ -86,6 +87,10 @@ pub struct PromoteArgs {
     pub label: String,
     #[arg(long, default_value_t = true)]
     pub update_previous: bool,
+    /// Refuse to promote a manifest that is not signed by a key listed in the
+    /// target's `trusted_keys`. Recommended for production.
+    #[arg(long)]
+    pub require_signed_manifest: bool,
 }
 
 #[derive(Debug, Args)]
@@ -136,4 +141,15 @@ pub struct GcArgs {
     pub dry_run: bool,
     #[arg(long)]
     pub delete: bool,
+}
+
+/// Walk the target's `v1/` namespace and write a fresh `v1/index.json` so HTTP
+/// public sources (which have no native bucket listing) can serve a directory
+/// equivalent to the operator-published store.
+#[derive(Debug, Args)]
+pub struct RebuildIndexArgs {
+    #[arg(long)]
+    pub target: String,
+    #[arg(long)]
+    pub config: PathBuf,
 }

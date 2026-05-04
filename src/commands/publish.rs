@@ -7,7 +7,6 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use std::{fs, path::Path};
-use uuid::Uuid;
 
 pub async fn run(args: PublishArgs) -> Result<()> {
     let cfg = Config::load(&args.config)?;
@@ -29,6 +28,11 @@ pub async fn run(args: PublishArgs) -> Result<()> {
     let id = snapshot_id(manifest.body.height, &manifest.body.state_root);
     let final_manifest = format!("v1/snapshots/full/{id}/manifest.json");
     let final_artifact = format!("v1/snapshots/full/{id}/snapshot.tar.zst");
+
+    // Upload the artifact directly to its final key so we never depend on
+    // server-side single-PUT copies (limited to 5 GiB on S3-compatible
+    // backends). The manifest is written LAST so that a partial publish never
+    // leaves a manifest pointing at a missing or shorter artifact.
     put_immutable_file(store.as_ref(), &final_artifact, &artifact_path, &local_hash).await?;
     put_immutable_bytes(store.as_ref(), &final_manifest, &manifest_bytes).await?;
 
@@ -48,17 +52,11 @@ async fn put_immutable_bytes(
         }
         return Ok(());
     }
-    let staging = format!(
-        "v1/staging/{}/{}",
-        Uuid::new_v4(),
-        path.rsplit('/').next().unwrap_or("object")
-    );
-    store.put(&staging, bytes).await?;
-    let staged = store.get(&staging).await?;
-    if staged.len() != bytes.len() || staged != bytes {
-        bail!("staged object verification failed for {path}");
-    }
     store.put(path, bytes).await?;
+    let written = store.get(path).await?;
+    if written != bytes {
+        bail!("post-write read-back mismatch for {path}");
+    }
     Ok(())
 }
 
@@ -80,32 +78,26 @@ async fn put_immutable_file(
         }
         return Ok(());
     }
-    let staging = format!(
-        "v1/staging/{}/{}",
-        Uuid::new_v4(),
-        path.rsplit('/').next().unwrap_or("object")
-    );
-    store.put_file(&staging, source).await?;
-    let staged_meta = store
-        .stat(&staging)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("staged object missing after upload: {staging}"))?;
-    if staged_meta.size != expected.size {
-        bail!("staged object size mismatch for {path}");
-    }
-    let tmp = tempfile::NamedTempFile::new()?;
-    store.get_to_file(&staging, tmp.path()).await?;
-    let staged = hashing::hash_file(tmp.path())?;
-    if staged.sha256 != expected.sha256 || staged.blake3 != expected.blake3 {
-        bail!("staged object hash mismatch for {path}");
-    }
-    store.copy(&staging, path).await?;
+    // Direct upload to the final key, then re-stat and re-hash by streaming
+    // the object back into a temp file. This avoids server-side multipart copy
+    // and keeps memory bounded for large archives.
+    store.put_file(path, source).await?;
     let final_meta = store
         .stat(path)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("final object missing after copy: {path}"))?;
+        .ok_or_else(|| anyhow::anyhow!("final object missing after upload: {path}"))?;
     if final_meta.size != expected.size {
-        bail!("final object size mismatch for {path}");
+        bail!(
+            "final object size mismatch for {path}: expected {}, got {}",
+            expected.size,
+            final_meta.size
+        );
+    }
+    let tmp = tempfile::NamedTempFile::new()?;
+    store.get_to_file(path, tmp.path()).await?;
+    let written = hashing::hash_file(tmp.path())?;
+    if written.sha256 != expected.sha256 || written.blake3 != expected.blake3 {
+        bail!("post-upload hash mismatch for {path}");
     }
     Ok(())
 }

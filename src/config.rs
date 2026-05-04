@@ -42,6 +42,13 @@ pub enum Endpoint {
         trusted_keys: Vec<String>,
         signing_key: Option<String>,
         signing_key_id: Option<String>,
+        /// Object size at or above which uploads use multipart. Defaults to 64 MiB.
+        #[serde(default)]
+        multipart_threshold: Option<u64>,
+        /// Part size for multipart uploads. Defaults to 16 MiB. Must be >= 5 MiB
+        /// (S3 minimum) for all parts except the last.
+        #[serde(default)]
+        multipart_part_size: Option<u64>,
     },
 }
 

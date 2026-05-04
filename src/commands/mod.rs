@@ -1,4 +1,5 @@
 pub mod gc;
+pub mod index;
 pub mod list;
 pub mod pack;
 pub mod promote;
@@ -18,5 +19,6 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::List(args) => list::run(args).await,
         Command::Restore(args) => restore::run(args).await,
         Command::Gc(args) => gc::run(args).await,
+        Command::RebuildIndex(args) => index::run(args).await,
     }
 }
