@@ -42,7 +42,7 @@ fn append_dir_stable<W: std::io::Write>(
         if rel.as_os_str().is_empty() {
             continue;
         }
-        if is_forbidden_snapshot_path(rel) {
+        if is_forbidden_snapshot_path(archive_root, rel) {
             continue;
         }
         let archive_path = Path::new(archive_root).join(rel);
@@ -68,14 +68,15 @@ fn append_dir_stable<W: std::io::Write>(
     Ok(())
 }
 
-fn is_forbidden_snapshot_path(path: &Path) -> bool {
+fn is_forbidden_snapshot_path(archive_root: &str, path: &Path) -> bool {
     let lower = path.to_string_lossy().to_ascii_lowercase();
+    let is_chain_db = archive_root == "chain.db";
     lower.contains("wallet")
         || lower.contains("consensus")
         || lower.contains("credential")
         || lower.contains("secret")
         || lower.contains("signing")
-        || lower.ends_with(".log")
+        || (!is_chain_db && lower.ends_with(".log"))
         || lower.contains("/logs/")
         || lower.starts_with("logs/")
 }

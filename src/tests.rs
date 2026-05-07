@@ -96,7 +96,9 @@ fn make_profile(root: &Path) {
     fs::create_dir_all(root.join("chain.db")).unwrap();
     fs::write(root.join("state/state.id"), [7u8; 32]).unwrap();
     fs::write(root.join("state/value"), b"state").unwrap();
+    fs::write(root.join("state/debug.log"), b"app log").unwrap();
     fs::write(root.join("chain.db/value"), b"chain").unwrap();
+    fs::write(root.join("chain.db/000001.log"), b"rocksdb wal").unwrap();
 }
 
 async fn pack_candidate(tmp: &TempDir, signed: bool) -> std::path::PathBuf {
@@ -183,6 +185,11 @@ async fn pack_creates_manifest_archive_and_validates_state_id() {
     })
     .await
     .unwrap();
+
+    let extract = tempfile::tempdir().unwrap();
+    safe_extract::extract_zstd_tar_safe(&artifact_path, extract.path()).unwrap();
+    assert!(extract.path().join("chain.db/000001.log").exists());
+    assert!(!extract.path().join("state/debug.log").exists());
 
     let bad = tempfile::tempdir().unwrap();
     fs::create_dir_all(bad.path().join("state")).unwrap();
