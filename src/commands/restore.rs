@@ -219,11 +219,7 @@ fn replace_profile(destination: &Path, extracted: &Path) -> Result<()> {
             }
             rollback_from_backup(destination, &backup, &moved_to_backup);
             return Err(err).with_context(|| {
-                format!(
-                    "failed to install restored {} at {}",
-                    name,
-                    live.display()
-                )
+                format!("failed to install restored {} at {}", name, live.display())
             });
         }
         installed.push(name);

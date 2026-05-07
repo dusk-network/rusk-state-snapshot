@@ -43,7 +43,7 @@ pub struct GcPolicy {
 impl RetentionPolicy {
     pub fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        Ok(toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?)
+        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))
     }
 
     pub fn grace_period(&self) -> Result<Duration> {

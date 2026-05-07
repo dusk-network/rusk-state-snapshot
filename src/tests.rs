@@ -818,12 +818,10 @@ async fn rebuild_index_lists_all_v1_objects_and_excludes_self() {
         .map(|v| v["path"].as_str().unwrap().to_string())
         .collect();
     assert!(paths.contains(&"v1/pointers/latest.json".to_string()));
-    assert!(paths.contains(
-        &"v1/snapshots/full/h000000001-sr_22222222/manifest.json".to_string()
-    ));
-    assert!(paths.contains(
-        &"v1/snapshots/full/h000000001-sr_22222222/snapshot.tar.zst".to_string()
-    ));
+    assert!(paths.contains(&"v1/snapshots/full/h000000001-sr_22222222/manifest.json".to_string()));
+    assert!(
+        paths.contains(&"v1/snapshots/full/h000000001-sr_22222222/snapshot.tar.zst".to_string())
+    );
     // The index never describes itself.
     assert!(!paths.contains(&"v1/index.json".to_string()));
     // Sizes are recorded.
@@ -887,8 +885,7 @@ async fn promote_requires_signed_manifest_and_artifact_existence() {
         require_signed_manifest: true,
     })
     .await
-    .err()
-    .expect("must reject promotion when artifact size differs from manifest");
+    .expect_err("must reject promotion when artifact size differs from manifest");
     assert!(err.to_string().contains("size mismatch"), "{err}");
 
     // Remove the artifact entirely.
@@ -902,8 +899,7 @@ async fn promote_requires_signed_manifest_and_artifact_existence() {
         require_signed_manifest: true,
     })
     .await
-    .err()
-    .expect("must reject promotion when artifact is missing");
+    .expect_err("must reject promotion when artifact is missing");
     assert!(err.to_string().contains("missing"), "{err}");
 }
 
@@ -940,8 +936,7 @@ async fn promote_rejects_unsigned_manifest_when_required() {
         require_signed_manifest: true,
     })
     .await
-    .err()
-    .expect("unsigned manifest must be rejected when required");
+    .expect_err("unsigned manifest must be rejected when required");
     assert!(err.to_string().contains("unsigned"), "{err}");
 }
 
@@ -1063,4 +1058,3 @@ async fn remote_verify_streams_artifact_to_temp_file() {
     .unwrap();
     server.await.unwrap();
 }
-

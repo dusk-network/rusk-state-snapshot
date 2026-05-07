@@ -38,8 +38,14 @@ pub struct S3Store {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UploadPlan {
-    Single { size: u64 },
-    Multipart { size: u64, part_size: u64, parts: u64 },
+    Single {
+        size: u64,
+    },
+    Multipart {
+        size: u64,
+        part_size: u64,
+        parts: u64,
+    },
 }
 
 impl S3Store {
@@ -83,16 +89,14 @@ impl S3Store {
         if size < self.multipart_threshold {
             return UploadPlan::Single { size };
         }
-        let part_size = if (size + self.multipart_part_size - 1) / self.multipart_part_size
-            > S3_MAX_PARTS
-        {
+        let part_size = if size.div_ceil(self.multipart_part_size) > S3_MAX_PARTS {
             // Recompute to fit within S3_MAX_PARTS.
-            let needed = (size + S3_MAX_PARTS - 1) / S3_MAX_PARTS;
+            let needed = size.div_ceil(S3_MAX_PARTS);
             needed.max(S3_MIN_PART_SIZE)
         } else {
             self.multipart_part_size
         };
-        let parts = (size + part_size - 1) / part_size;
+        let parts = size.div_ceil(part_size);
         UploadPlan::Multipart {
             size,
             part_size,
@@ -345,7 +349,10 @@ impl S3Store {
         }
         .await;
         match result {
-            Ok(etags) => self.complete_multipart_upload(path, &upload_id, etags).await,
+            Ok(etags) => {
+                self.complete_multipart_upload(path, &upload_id, etags)
+                    .await
+            }
             Err(err) => {
                 let _ = self.abort_multipart_upload(path, &upload_id).await;
                 Err(err)
@@ -734,7 +741,9 @@ pub(crate) fn extract_xml_text<'a>(text: &'a str, tag: &str) -> Option<&'a str> 
 pub fn parse_list_page(text: &str) -> (Vec<(String, u64)>, Option<String>) {
     let mut out = Vec::new();
     for object in extract_xml_blocks(text, "Contents") {
-        let key = extract_xml_text(object, "Key").unwrap_or_default().to_string();
+        let key = extract_xml_text(object, "Key")
+            .unwrap_or_default()
+            .to_string();
         let size = extract_xml_text(object, "Size")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);

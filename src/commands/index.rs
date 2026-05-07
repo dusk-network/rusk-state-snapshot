@@ -39,9 +39,7 @@ pub async fn run(args: RebuildIndexArgs) -> Result<()> {
 
 /// Collect every reachable object under `v1/` (excluding the index itself) into
 /// a stable, deduplicated, lexicographically-sorted entry list.
-pub async fn build_index_entries(
-    store: &dyn object_store::ObjectStore,
-) -> Result<Vec<IndexEntry>> {
+pub async fn build_index_entries(store: &dyn object_store::ObjectStore) -> Result<Vec<IndexEntry>> {
     // Use BTreeMap to deduplicate by path and sort.
     let mut map: BTreeMap<String, u64> = BTreeMap::new();
     for prefix in [

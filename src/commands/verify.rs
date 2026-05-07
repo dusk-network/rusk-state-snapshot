@@ -1,7 +1,11 @@
 use crate::{cli::VerifyArgs, config::Config, hashing, manifest::SignedManifest, safe_extract};
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 use tokio::io::AsyncWriteExt;
 
 pub async fn run(args: VerifyArgs) -> Result<()> {
@@ -22,10 +26,7 @@ async fn verify_remote(args: VerifyArgs) -> Result<()> {
     let manifest_url = args.manifest.clone();
     let manifest_res = reqwest::get(&manifest_url).await?;
     if !manifest_res.status().is_success() {
-        bail!(
-            "fetch {manifest_url} failed with {}",
-            manifest_res.status()
-        );
+        bail!("fetch {manifest_url} failed with {}", manifest_res.status());
     }
     let bytes = manifest_res.bytes().await?.to_vec();
     let manifest: SignedManifest = serde_json::from_slice(&bytes)?;
@@ -66,7 +67,7 @@ async fn verify_remote(args: VerifyArgs) -> Result<()> {
 
 pub async fn verify_manifest_local(
     manifest: &SignedManifest,
-    manifest_path: &PathBuf,
+    manifest_path: &Path,
     args: VerifyArgs,
 ) -> Result<()> {
     manifest.validate_schema()?;

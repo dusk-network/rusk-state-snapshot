@@ -26,9 +26,7 @@ pub async fn run(args: PromoteArgs) -> Result<()> {
     // manifest unless it is signed by a trusted publisher key.
     if args.require_signed_manifest {
         if trusted_manifest_keys.is_empty() {
-            bail!(
-                "--require-signed-manifest set but target has no trusted_keys configured"
-            );
+            bail!("--require-signed-manifest set but target has no trusted_keys configured");
         }
         manifest.verify_signature(&trusted_manifest_keys)?;
     } else if manifest.signature.is_some() && !trusted_manifest_keys.is_empty() {
