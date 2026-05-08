@@ -11,7 +11,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 
 pub async fn run(args: WatchArgs) -> Result<()> {
     let policy = RetentionPolicy::load(&args.policy)?;
@@ -228,7 +228,7 @@ async fn maybe_capture_latest(
 }
 
 async fn existing_labels(
-    config: &PathBuf,
+    config: &Path,
     source_name: &str,
     target_name: &str,
     desired: &[Target],

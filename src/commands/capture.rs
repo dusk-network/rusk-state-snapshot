@@ -6,7 +6,7 @@ use crate::{
     tip::{Tip, TipSource},
 };
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Months, NaiveDate, TimeZone, Utc};
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -66,17 +66,11 @@ async fn capture_while_stopped(
 ) -> Result<CaptureResult> {
     let cutoff = parse_cutoff(args.cutoff.as_deref())?;
     let max_capture_lag = parse_duration(&args.max_capture_lag)?;
-    let stopped_tip = match tip_source.read().await {
-        Ok(tip) => tip,
-        Err(err) => {
-            if !args.allow_prestop_tip {
-                eprintln!(
-                    "warning: could not read tip after stopping service, using pre-stop tip metadata: {err}"
-                );
-            }
-            pre_stop_tip
-        }
-    };
+    let stopped_tip = select_stopped_tip(
+        pre_stop_tip,
+        tip_source.read().await,
+        args.allow_prestop_tip,
+    )?;
     validate_tip_for_labels(
         &stopped_tip,
         &args.labels,
@@ -156,6 +150,7 @@ pub fn validate_tip_for_labels(
     }
     let cutoff =
         cutoff.ok_or_else(|| anyhow::anyhow!("--cutoff is required for calendar labels"))?;
+    validate_calendar_labels_match_cutoff(labels, cutoff)?;
     if tip.block_timestamp < cutoff {
         bail!(
             "local tip timestamp {} is before requested cutoff {}",
@@ -176,8 +171,75 @@ pub fn validate_tip_for_labels(
     Ok(())
 }
 
+pub fn validate_calendar_labels_match_cutoff(
+    labels: &[String],
+    cutoff: DateTime<Utc>,
+) -> Result<()> {
+    for label in labels {
+        let Some(expected) = expected_cutoff_for_calendar_label(label)? else {
+            continue;
+        };
+        if expected != cutoff {
+            bail!("calendar label {label} requires cutoff {expected}, got {cutoff}");
+        }
+    }
+    Ok(())
+}
+
+pub fn select_stopped_tip(
+    pre_stop_tip: Tip,
+    stopped_tip: Result<Tip>,
+    allow_prestop_tip: bool,
+) -> Result<Tip> {
+    match stopped_tip {
+        Ok(tip) => Ok(tip),
+        Err(err) if allow_prestop_tip => {
+            eprintln!(
+                "warning: could not read tip after stopping service, using pre-stop tip metadata: {err}"
+            );
+            Ok(pre_stop_tip)
+        }
+        Err(err) => Err(err).context(
+            "could not read tip after stopping service; refusing to use pre-stop tip metadata without --allow-prestop-tip",
+        ),
+    }
+}
+
 fn is_calendar_label(label: &str) -> bool {
     label.starts_with("daily:") || label.starts_with("monthly:") || label.starts_with("yearly:")
+}
+
+fn expected_cutoff_for_calendar_label(label: &str) -> Result<Option<DateTime<Utc>>> {
+    if let Some(day) = label.strip_prefix("daily:") {
+        let day = NaiveDate::parse_from_str(day, "%Y-%m-%d")
+            .with_context(|| format!("daily label {label} must use YYYY-MM-DD"))?;
+        return Ok(Some(utc_midnight(day + ChronoDuration::days(1))));
+    }
+    if let Some(month) = label.strip_prefix("monthly:") {
+        let month = NaiveDate::parse_from_str(&format!("{month}-01"), "%Y-%m-%d")
+            .with_context(|| format!("monthly label {label} must use YYYY-MM"))?;
+        let cutoff = month
+            .checked_add_months(Months::new(1))
+            .ok_or_else(|| anyhow::anyhow!("monthly label {label} is out of range"))?;
+        return Ok(Some(utc_midnight(cutoff)));
+    }
+    if let Some(year) = label.strip_prefix("yearly:") {
+        let year: i32 = year
+            .parse()
+            .with_context(|| format!("yearly label {label} must use YYYY"))?;
+        let cutoff = Utc
+            .with_ymd_and_hms(year + 1, 1, 1, 0, 0, 0)
+            .single()
+            .ok_or_else(|| anyhow::anyhow!("yearly label {label} is out of range"))?;
+        return Ok(Some(cutoff));
+    }
+    Ok(None)
+}
+
+fn utc_midnight(date: NaiveDate) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
+        .single()
+        .unwrap()
 }
 
 fn parse_cutoff(input: Option<&str>) -> Result<Option<DateTime<Utc>>> {

@@ -144,6 +144,13 @@ cargo run -- capture \
   --rebuild-index
 ```
 
+For calendar labels, direct `capture` validates that the label matches the
+cutoff. For example, `monthly:2025-12` and `yearly:2025` both require
+`--cutoff 2026-01-01T00:00:00Z`; `monthly:2025-05` would require
+`--cutoff 2025-06-01T00:00:00Z`. If the stopped-tip read fails, `capture`
+fails by default; use `--allow-prestop-tip` only when falling back to pre-stop
+metadata is intentional.
+
 ## Scope
 
 Version 0 packs full provisioner snapshots only. The archive includes:

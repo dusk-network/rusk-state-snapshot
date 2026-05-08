@@ -813,6 +813,65 @@ fn capture_refuses_calendar_labels_outside_lag_unless_overridden() {
     .is_ok());
 }
 
+#[test]
+fn capture_requires_calendar_labels_to_match_cutoff() {
+    let labels = vec!["monthly:2025-12".to_string(), "yearly:2025".to_string()];
+    assert!(commands::capture::validate_tip_for_labels(
+        &test_tip("2026-01-01T00:30:00Z"),
+        &labels,
+        Some(dt("2026-01-01T00:00:00Z")),
+        std::time::Duration::from_secs(3600),
+        false,
+    )
+    .is_ok());
+
+    let wrong_month = vec!["monthly:2025-05".to_string()];
+    assert!(commands::capture::validate_tip_for_labels(
+        &test_tip("2026-01-01T00:30:00Z"),
+        &wrong_month,
+        Some(dt("2026-01-01T00:00:00Z")),
+        std::time::Duration::from_secs(3600),
+        true,
+    )
+    .is_err());
+
+    let bad_daily = vec!["daily:day-1".to_string()];
+    assert!(commands::capture::validate_tip_for_labels(
+        &test_tip("2026-05-08T00:30:00Z"),
+        &bad_daily,
+        Some(dt("2026-05-08T00:00:00Z")),
+        std::time::Duration::from_secs(3600),
+        true,
+    )
+    .is_err());
+}
+
+#[test]
+fn capture_uses_prestop_tip_only_when_explicitly_allowed() {
+    let pre_stop_tip = test_tip("2026-01-01T00:00:00Z");
+    let stopped_tip = test_tip("2026-01-01T00:00:10Z");
+
+    let selected =
+        commands::capture::select_stopped_tip(pre_stop_tip.clone(), Ok(stopped_tip.clone()), false)
+            .unwrap();
+    assert_eq!(selected, stopped_tip);
+
+    assert!(commands::capture::select_stopped_tip(
+        pre_stop_tip.clone(),
+        Err(anyhow::anyhow!("tip failed")),
+        false,
+    )
+    .is_err());
+
+    let selected = commands::capture::select_stopped_tip(
+        pre_stop_tip.clone(),
+        Err(anyhow::anyhow!("tip failed")),
+        true,
+    )
+    .unwrap();
+    assert_eq!(selected, pre_stop_tip);
+}
+
 // ---------------------------------------------------------------------------
 // Multipart decision logic
 // ---------------------------------------------------------------------------
