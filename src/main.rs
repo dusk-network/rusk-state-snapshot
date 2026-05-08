@@ -4,12 +4,15 @@ mod commands;
 mod config;
 mod errors;
 mod hashing;
+mod journal;
 mod manifest;
 mod object_store;
+mod planner;
 mod pointer;
 mod retention;
 mod safe_extract;
 mod signing;
+mod tip;
 
 use anyhow::Result;
 use clap::Parser;

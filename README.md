@@ -18,6 +18,16 @@ The trust model is manifest based:
 
 ## Commands
 
+Plan the currently desired calendar labels from UTC wall-clock time:
+
+```sh
+cargo run -- plan \
+  --network mainnet \
+  --policy ./examples/retention.example.toml \
+  --now 2026-05-08T14:57:00Z \
+  --genesis-time 2025-01-01T00:00:00Z
+```
+
 ```sh
 cargo run -- pack \
   --network mainnet \
@@ -77,6 +87,61 @@ cargo run -- gc \
 cargo run -- rebuild-index \
   --config ./examples/config.example.toml \
   --target local_mainnet
+```
+
+The primitive publishing flow is:
+
+```text
+pack -> publish -> promote -> rebuild-index -> gc
+```
+
+For long-running syncs, the orchestrated flow is:
+
+```text
+plan -> watch -> capture
+```
+
+`watch` computes desired labels repeatedly, polls an external tip source, marks
+labels missed when their cutoffs were already passed without observation, and
+calls `capture` only when the local node crosses a cutoff inside the configured
+capture lag window.
+
+```sh
+cargo run -- watch \
+  --network mainnet \
+  --policy ./examples/retention.example.toml \
+  --config ./examples/config.example.toml \
+  --source local_mainnet \
+  --target local_mainnet \
+  --state-dir ./testdata/state \
+  --chain-db-dir ./testdata/chain.db \
+  --tip-file ./testdata/tip.json \
+  --journal ./target/watch-mainnet.json \
+  --poll-interval 1s \
+  --max-capture-lag 1h \
+  --latest-freshness-window 24h \
+  --latest-min-interval 24h
+```
+
+`capture` performs one stopped-state snapshot and promotes all provided labels
+to the same immutable manifest:
+
+```sh
+cargo run -- capture \
+  --network mainnet \
+  --labels monthly:2025-12,yearly:2025 \
+  --cutoff 2026-01-01T00:00:00Z \
+  --config ./examples/config.example.toml \
+  --target local_mainnet \
+  --state-dir ./testdata/state \
+  --chain-db-dir ./testdata/chain.db \
+  --tip-file ./testdata/tip.json \
+  --manage-service rusk \
+  --manifest-signing-key file:/etc/rusk-state-snapshot/mainnet-manifest-key \
+  --manifest-key-id dusk-mainnet-2026 \
+  --publisher-name "Dusk Network" \
+  --require-signed-manifest \
+  --rebuild-index
 ```
 
 ## Scope
@@ -157,10 +222,59 @@ before verification.
 pointer labels according to the retention policy, then loads remaining pointers,
 marks reachable manifests and artifacts, reports unreferenced snapshot/staging
 objects older than the grace period, and deletes them only with `--delete`. It
-never touches local node state.
+never touches local node state. It prunes stale pointers and unreferenced
+artifacts; it does not create daily, monthly, yearly, or latest labels.
+
+## Calendar Orchestration
+
+Calendar retention labels are generated from UTC wall-clock time, not from the
+historical sync stream:
+
+- `daily` means the last N completed UTC days.
+- `monthly` means the last N completed UTC months.
+- `yearly` means completed UTC years. With `keep_years = 0`, planning uses
+  `--genesis-time` as the first possible year; without `--genesis-time`, it
+  defaults to the previous completed year.
+
+A calendar label is only honest if the watcher observes the local tip crossing
+that label's cutoff:
+
+```text
+previous_local_tip_time < cutoff <= current_local_tip_time
+```
+
+The capture is allowed only when the current local tip is within
+`--max-capture-lag` of the cutoff. If the watcher starts from an already
+partially synced node, or if it was not running when a cutoff was crossed, the
+missing label is recorded as missed in the local journal. Missed labels are not
+published as remote pointers. Producing a complete historical set requires
+syncing from scratch or from a state before the missing cutoffs.
+
+`latest` has a separate freshness policy. `watch` promotes `latest` only when
+the local tip is within `--latest-freshness-window` of a trusted network tip
+source, or of wall-clock time when no network tip source is configured. A node
+that is months behind may still capture honest historical calendar labels as it
+crosses their cutoffs, but it will not update `latest`.
+
+Tip metadata is supplied by a standalone JSON command or file. The tool does
+not import Rusk code:
+
+```json
+{
+  "height": 1234567,
+  "block_hash": "0000000000000000000000000000000000000000000000000000000000000001",
+  "state_root": "1111111111111111111111111111111111111111111111111111111111111111",
+  "block_timestamp": "2026-05-08T00:00:00Z"
+}
+```
+
+For official publishing, run `watch` from scratch for complete historical
+labels, publish testnet before mainnet, and use a tip command that can read
+consistent stopped-state metadata. `capture` requires `--manage-service` so the
+state and chain database are packed while Rusk is stopped.
 
 ## No Runtime Integration
 
-This tool does not integrate with a running Rusk process and does not add any
-automatic publishing behavior to Rusk. Service stop/start during restore is
-explicit and opt-in via `--manage-service`.
+This tool does not import a running Rusk process and does not add any automatic
+publishing behavior to Rusk itself. Service stop/start during restore and
+capture is explicit via `--manage-service`.

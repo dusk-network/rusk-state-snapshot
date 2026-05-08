@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -19,6 +19,15 @@ pub enum Command {
     Restore(RestoreArgs),
     Gc(GcArgs),
     RebuildIndex(RebuildIndexArgs),
+    Plan(PlanArgs),
+    Watch(WatchArgs),
+    Capture(CaptureArgs),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum OutputFormat {
+    Json,
+    Text,
 }
 
 #[derive(Debug, Args)]
@@ -152,4 +161,118 @@ pub struct RebuildIndexArgs {
     pub target: String,
     #[arg(long)]
     pub config: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct PlanArgs {
+    #[arg(long)]
+    pub network: String,
+    #[arg(long)]
+    pub policy: PathBuf,
+    #[arg(long)]
+    pub source: Option<String>,
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    #[arg(long)]
+    pub now: Option<String>,
+    #[arg(long)]
+    pub genesis_time: Option<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct WatchArgs {
+    #[arg(long)]
+    pub network: String,
+    #[arg(long)]
+    pub policy: PathBuf,
+    #[arg(long)]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub source: String,
+    #[arg(long)]
+    pub target: String,
+    #[arg(long)]
+    pub state_dir: PathBuf,
+    #[arg(long)]
+    pub chain_db_dir: PathBuf,
+    #[arg(long)]
+    pub tip_command: Option<String>,
+    #[arg(long)]
+    pub tip_file: Option<PathBuf>,
+    #[arg(long)]
+    pub network_tip_command: Option<String>,
+    #[arg(long)]
+    pub network_tip_file: Option<PathBuf>,
+    #[arg(long)]
+    pub manage_service: Option<String>,
+    #[arg(long)]
+    pub manifest_signing_key: Option<String>,
+    #[arg(long)]
+    pub manifest_key_id: Option<String>,
+    #[arg(long)]
+    pub publisher_name: Option<String>,
+    #[arg(long)]
+    pub require_signed_manifest: bool,
+    #[arg(long)]
+    pub journal: PathBuf,
+    #[arg(long, default_value = "10s")]
+    pub poll_interval: String,
+    #[arg(long, default_value = "1h")]
+    pub max_capture_lag: String,
+    #[arg(long, default_value = "24h")]
+    pub latest_freshness_window: String,
+    #[arg(long, default_value = "24h")]
+    pub latest_min_interval: String,
+    #[arg(long)]
+    pub genesis_time: Option<String>,
+    #[arg(long, default_value = "unknown")]
+    pub rusk_version: String,
+    #[arg(long)]
+    pub allow_prestop_tip: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct CaptureArgs {
+    #[arg(long)]
+    pub network: String,
+    #[arg(long, value_delimiter = ',')]
+    pub labels: Vec<String>,
+    #[arg(long)]
+    pub cutoff: Option<String>,
+    #[arg(long)]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub target: String,
+    #[arg(long)]
+    pub state_dir: PathBuf,
+    #[arg(long)]
+    pub chain_db_dir: PathBuf,
+    #[arg(long)]
+    pub tip_command: Option<String>,
+    #[arg(long)]
+    pub tip_file: Option<PathBuf>,
+    #[arg(long)]
+    pub manage_service: Option<String>,
+    #[arg(long)]
+    pub manifest_signing_key: Option<String>,
+    #[arg(long)]
+    pub manifest_key_id: Option<String>,
+    #[arg(long)]
+    pub publisher_name: Option<String>,
+    #[arg(long)]
+    pub require_signed_manifest: bool,
+    #[arg(long)]
+    pub rebuild_index: bool,
+    #[arg(long)]
+    pub leave_stopped_on_error: bool,
+    #[arg(long)]
+    pub allow_prestop_tip: bool,
+    #[arg(long)]
+    pub allow_stale_calendar: bool,
+    #[arg(long, default_value = "1h")]
+    pub max_capture_lag: String,
+    #[arg(long, default_value = "unknown")]
+    pub rusk_version: String,
 }

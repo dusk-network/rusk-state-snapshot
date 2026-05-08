@@ -4,6 +4,7 @@ use crate::{
     commands,
     config::Endpoint,
     hashing,
+    journal::WatchJournal,
     manifest::{
         Artifact, ComponentEntry, Components, ManifestBody, SignedManifest, MANIFEST_FORMAT,
     },
@@ -13,10 +14,12 @@ use crate::{
         s3::{self, S3Store, UploadPlan},
         ObjectStore,
     },
+    planner::{self, Target, TargetKind},
     pointer::{PointerBody, SignedPointer, POINTER_FORMAT},
     retention, safe_extract, signing,
+    tip::{self, Tip},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::{fs, path::Path};
 use tempfile::TempDir;
 
@@ -89,6 +92,30 @@ fn trust(seed: &str) -> std::collections::HashMap<String, signing::TrustKey> {
         },
     );
     map
+}
+
+fn dt(input: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(input)
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+fn test_tip(timestamp: &str) -> Tip {
+    Tip {
+        height: 1,
+        block_hash: HASH1.to_string(),
+        state_root: HASH2.to_string(),
+        block_timestamp: dt(timestamp),
+    }
+}
+
+fn target(label: &str, kind: TargetKind, period: &str, cutoff: &str) -> Target {
+    Target {
+        label: label.to_string(),
+        kind,
+        period: period.to_string(),
+        cutoff: dt(cutoff),
+    }
 }
 
 fn make_profile(root: &Path) {
@@ -549,6 +576,241 @@ fn retention_duration_parses() {
     );
     assert!(kept.contains("2026-05-04"));
     assert!(kept.contains("2026-05-03"));
+}
+
+#[test]
+fn planner_builds_desired_completed_calendar_targets() {
+    let now = dt("2026-05-08T14:57:00Z");
+    let daily = planner::desired_daily_targets(now, 5);
+    assert_eq!(
+        daily.iter().map(|t| t.period.as_str()).collect::<Vec<_>>(),
+        vec![
+            "2026-05-03",
+            "2026-05-04",
+            "2026-05-05",
+            "2026-05-06",
+            "2026-05-07"
+        ]
+    );
+    assert_eq!(daily.last().unwrap().cutoff, dt("2026-05-08T00:00:00Z"));
+
+    let monthly = planner::desired_monthly_targets(now, 12);
+    assert_eq!(monthly.first().unwrap().label, "monthly:2025-05");
+    assert_eq!(monthly.last().unwrap().label, "monthly:2026-04");
+    assert_eq!(monthly.first().unwrap().cutoff, dt("2025-06-01T00:00:00Z"));
+    assert_eq!(monthly.last().unwrap().cutoff, dt("2026-05-01T00:00:00Z"));
+
+    let yearly = planner::desired_yearly_targets(now, 0, Some(dt("2025-01-01T00:00:00Z")));
+    assert_eq!(yearly.len(), 1);
+    assert_eq!(yearly[0].label, "yearly:2025");
+    assert_eq!(yearly[0].cutoff, dt("2026-01-01T00:00:00Z"));
+}
+
+#[test]
+fn planner_handles_leap_year_and_month_boundaries() {
+    let daily = planner::desired_daily_targets(dt("2024-03-01T12:00:00Z"), 1);
+    assert_eq!(daily[0].label, "daily:2024-02-29");
+    assert_eq!(daily[0].cutoff, dt("2024-03-01T00:00:00Z"));
+
+    let monthly = planner::desired_monthly_targets(dt("2026-01-15T00:00:00Z"), 1);
+    assert_eq!(monthly[0].label, "monthly:2025-12");
+    assert_eq!(monthly[0].cutoff, dt("2026-01-01T00:00:00Z"));
+
+    let yearly = planner::desired_yearly_targets(dt("2027-01-01T00:00:00Z"), 1, None);
+    assert_eq!(yearly[0].label, "yearly:2026");
+    assert_eq!(yearly[0].cutoff, dt("2027-01-01T00:00:00Z"));
+}
+
+#[test]
+fn watch_startup_marks_already_passed_missing_cutoffs_as_missed() {
+    let now = dt("2026-05-08T14:57:00Z");
+    let desired = planner::desired_monthly_targets(now, 12);
+    let mut journal = WatchJournal::new("mainnet".to_string(), now);
+    let existing = std::collections::BTreeSet::new();
+    commands::watch::classify_startup(
+        &mut journal,
+        &desired,
+        &existing,
+        &test_tip("2025-10-08T00:00:00Z"),
+        now,
+    );
+    let missed: Vec<String> = journal.missed.iter().map(|m| m.label.clone()).collect();
+    assert_eq!(
+        missed,
+        vec![
+            "monthly:2025-05",
+            "monthly:2025-06",
+            "monthly:2025-07",
+            "monthly:2025-08",
+            "monthly:2025-09"
+        ]
+    );
+    assert!(!journal.has_missed_label("monthly:2025-10"));
+}
+
+#[test]
+fn watch_crossing_groups_same_cutoff_and_marks_late_crossings_missed() {
+    let now = dt("2026-01-01T00:30:00Z");
+    let desired = vec![
+        target(
+            "monthly:2025-12",
+            TargetKind::Monthly,
+            "2025-12",
+            "2026-01-01T00:00:00Z",
+        ),
+        target(
+            "yearly:2025",
+            TargetKind::Yearly,
+            "2025",
+            "2026-01-01T00:00:00Z",
+        ),
+    ];
+    let mut journal = WatchJournal::new("mainnet".to_string(), now);
+    let existing = std::collections::BTreeSet::new();
+    let grouped = commands::watch::classify_crossings(
+        &mut journal,
+        &desired,
+        &existing,
+        &test_tip("2025-12-31T23:59:00Z"),
+        &test_tip("2026-01-01T00:30:00Z"),
+        std::time::Duration::from_secs(3600),
+        now,
+    );
+    assert_eq!(grouped.len(), 1);
+    let labels: Vec<String> = grouped
+        .values()
+        .next()
+        .unwrap()
+        .iter()
+        .map(|t| t.label.clone())
+        .collect();
+    assert_eq!(labels, vec!["monthly:2025-12", "yearly:2025"]);
+
+    let mut late_journal = WatchJournal::new("mainnet".to_string(), now);
+    let late = commands::watch::classify_crossings(
+        &mut late_journal,
+        &desired[..1],
+        &existing,
+        &test_tip("2025-12-31T23:59:00Z"),
+        &test_tip("2026-01-01T02:00:01Z"),
+        std::time::Duration::from_secs(3600),
+        now,
+    );
+    assert!(late.is_empty());
+    assert!(late_journal.has_missed_label("monthly:2025-12"));
+}
+
+#[test]
+fn latest_freshness_and_min_interval_are_enforced() {
+    let reference = dt("2026-05-08T14:57:00Z");
+    assert!(commands::watch::latest_is_fresh(
+        dt("2026-05-07T15:57:00Z"),
+        reference,
+        std::time::Duration::from_secs(24 * 3600)
+    ));
+    assert!(!commands::watch::latest_is_fresh(
+        dt("2026-05-07T13:57:00Z"),
+        reference,
+        std::time::Duration::from_secs(24 * 3600)
+    ));
+
+    let mut journal = WatchJournal::new("mainnet".to_string(), reference);
+    assert!(commands::watch::latest_interval_elapsed(
+        &journal,
+        std::time::Duration::from_secs(24 * 3600),
+        reference
+    ));
+    journal.latest = Some(crate::journal::LatestEntry {
+        last_promoted_at: dt("2026-05-08T00:00:00Z"),
+        last_snapshot_id: "h000000001-sr_22222222".to_string(),
+    });
+    assert!(!commands::watch::latest_interval_elapsed(
+        &journal,
+        std::time::Duration::from_secs(24 * 3600),
+        reference
+    ));
+}
+
+#[test]
+fn journal_atomic_save_and_load_preserves_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("watch.json");
+    let now = dt("2026-05-08T14:57:00Z");
+    let mut journal = WatchJournal::new("mainnet".to_string(), now);
+    journal.record_missed(
+        "monthly:2025-05".to_string(),
+        dt("2025-06-01T00:00:00Z"),
+        "test",
+        now,
+    );
+    crate::journal::save_atomic(&path, &mut journal, now).unwrap();
+    let loaded = crate::journal::load_or_create(&path, "mainnet", now).unwrap();
+    assert!(loaded.has_missed_label("monthly:2025-05"));
+}
+
+#[tokio::test]
+async fn tip_sources_parse_valid_json_and_reject_invalid_values() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("tip.json");
+    fs::write(
+        &path,
+        format!(
+            r#"{{
+              "height": 123,
+              "block_hash": "{HASH1}",
+              "state_root": "{HASH2}",
+              "block_timestamp": "2026-05-08T00:00:00Z"
+            }}"#
+        ),
+    )
+    .unwrap();
+    let parsed = tip::read_tip_file(&path).unwrap();
+    assert_eq!(parsed.height, 123);
+    assert_eq!(parsed.block_timestamp, dt("2026-05-08T00:00:00Z"));
+
+    fs::write(
+        &path,
+        format!(
+            r#"{{
+              "height": 123,
+              "block_hash": "abcd",
+              "state_root": "{HASH2}",
+              "block_timestamp": "2026-05-08T00:00:00Z"
+            }}"#
+        ),
+    )
+    .unwrap();
+    assert!(tip::read_tip_file(&path).is_err());
+    assert!(tip::read_tip_command("false").await.is_err());
+}
+
+#[test]
+fn capture_refuses_calendar_labels_outside_lag_unless_overridden() {
+    let labels = vec!["monthly:2025-12".to_string(), "yearly:2025".to_string()];
+    assert!(commands::capture::validate_tip_for_labels(
+        &test_tip("2026-01-01T00:30:00Z"),
+        &labels,
+        Some(dt("2026-01-01T00:00:00Z")),
+        std::time::Duration::from_secs(3600),
+        false,
+    )
+    .is_ok());
+    assert!(commands::capture::validate_tip_for_labels(
+        &test_tip("2026-01-01T02:00:00Z"),
+        &labels,
+        Some(dt("2026-01-01T00:00:00Z")),
+        std::time::Duration::from_secs(3600),
+        false,
+    )
+    .is_err());
+    assert!(commands::capture::validate_tip_for_labels(
+        &test_tip("2026-01-01T02:00:00Z"),
+        &labels,
+        Some(dt("2026-01-01T00:00:00Z")),
+        std::time::Duration::from_secs(3600),
+        true,
+    )
+    .is_ok());
 }
 
 // ---------------------------------------------------------------------------
