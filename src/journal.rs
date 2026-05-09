@@ -21,6 +21,8 @@ pub struct WatchJournal {
     pub captured: Vec<CapturedEntry>,
     #[serde(default)]
     pub missed: Vec<MissedEntry>,
+    #[serde(default)]
+    pub pending: Vec<PendingCandidateEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest: Option<LatestEntry>,
 }
@@ -42,6 +44,17 @@ pub struct MissedEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingCandidateEntry {
+    pub labels: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cutoff: Option<DateTime<Utc>>,
+    pub snapshot_id: String,
+    pub candidate_path: std::path::PathBuf,
+    pub manifest_path_remote: String,
+    pub packed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatestEntry {
     pub last_promoted_at: DateTime<Utc>,
     pub last_snapshot_id: String,
@@ -57,6 +70,7 @@ impl WatchJournal {
             last_seen_tip: None,
             captured: Vec::new(),
             missed: Vec::new(),
+            pending: Vec::new(),
             latest: None,
         }
     }
@@ -67,6 +81,12 @@ impl WatchJournal {
 
     pub fn has_missed_label(&self, label: &str) -> bool {
         self.missed.iter().any(|entry| entry.label == label)
+    }
+
+    pub fn has_pending_label(&self, label: &str) -> bool {
+        self.pending
+            .iter()
+            .any(|entry| entry.labels.iter().any(|pending| pending == label))
     }
 
     pub fn record_missed(
@@ -105,6 +125,32 @@ impl WatchJournal {
                 captured_at: now,
             });
         }
+    }
+
+    pub fn record_pending(
+        &mut self,
+        labels: Vec<String>,
+        cutoff: Option<DateTime<Utc>>,
+        snapshot_id: String,
+        candidate_path: std::path::PathBuf,
+        manifest_path_remote: String,
+        now: DateTime<Utc>,
+    ) {
+        self.pending
+            .retain(|entry| !entry.labels.iter().any(|label| labels.contains(label)));
+        self.pending.push(PendingCandidateEntry {
+            labels,
+            cutoff,
+            snapshot_id,
+            candidate_path,
+            manifest_path_remote,
+            packed_at: now,
+        });
+    }
+
+    pub fn remove_pending_snapshot(&mut self, snapshot_id: &str) {
+        self.pending
+            .retain(|entry| entry.snapshot_id != snapshot_id);
     }
 }
 

@@ -117,14 +117,19 @@ cargo run -- watch \
   --chain-db-dir ./testdata/chain.db \
   --tip-file ./testdata/tip.json \
   --journal ./target/watch-mainnet.json \
+  --spool-dir ./target/mainnet-snapshot-spool \
   --poll-interval 1s \
   --max-capture-lag 1h \
   --latest-freshness-window 24h \
   --latest-min-interval 24h
 ```
 
-`capture` performs one stopped-state snapshot and promotes all provided labels
-to the same immutable manifest:
+`capture` stops Rusk only long enough to write and verify a local immutable
+candidate. Once `snapshot.tar.zst`, `manifest.json`, and `candidate.json` are
+complete in the spool directory, Rusk is started again. Upload, promotion, and
+index rebuild then read only those candidate files, never the live `state/` or
+`chain.db/` paths. All provided labels are promoted to the same immutable
+manifest:
 
 ```sh
 cargo run -- capture \
@@ -135,6 +140,7 @@ cargo run -- capture \
   --target local_mainnet \
   --state-dir ./testdata/state \
   --chain-db-dir ./testdata/chain.db \
+  --spool-dir ./target/mainnet-snapshot-spool \
   --tip-file ./testdata/tip.json \
   --manage-service rusk \
   --manifest-signing-key file:/etc/rusk-state-snapshot/mainnet-manifest-key \
@@ -150,6 +156,22 @@ cutoff. For example, `monthly:2025-12` and `yearly:2025` both require
 `--cutoff 2025-06-01T00:00:00Z`. If the stopped-tip read fails, `capture`
 fails by default; use `--allow-prestop-tip` only when falling back to pre-stop
 metadata is intentional.
+
+The candidate spool layout is:
+
+```text
+<spool-dir>/
+  candidates/
+    h001234567-sr_abcd1234/
+      snapshot.tar.zst
+      manifest.json
+      candidate.json
+```
+
+`candidate.json` is the publishable marker. Watch records packed candidates as
+pending in its journal before publishing; if publish or promotion fails after
+Rusk has restarted, the next watch iteration retries from the same candidate
+without stopping Rusk or repacking.
 
 ## Scope
 
@@ -277,8 +299,9 @@ not import Rusk code:
 
 For official publishing, run `watch` from scratch for complete historical
 labels, publish testnet before mainnet, and use a tip command that can read
-consistent stopped-state metadata. `capture` requires `--manage-service` so the
-state and chain database are packed while Rusk is stopped.
+consistent stopped-state metadata. `capture` requires `--manage-service`; the
+state and chain database are packed while Rusk is stopped, then the service is
+restarted before remote publication begins.
 
 ## No Runtime Integration
 

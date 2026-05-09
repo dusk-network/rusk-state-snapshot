@@ -217,6 +217,8 @@ pub struct WatchArgs {
     pub require_signed_manifest: bool,
     #[arg(long)]
     pub journal: PathBuf,
+    #[arg(long)]
+    pub spool_dir: Option<PathBuf>,
     #[arg(long, default_value = "10s")]
     pub poll_interval: String,
     #[arg(long, default_value = "1h")]
@@ -250,6 +252,8 @@ pub struct CaptureArgs {
     #[arg(long)]
     pub chain_db_dir: PathBuf,
     #[arg(long)]
+    pub spool_dir: Option<PathBuf>,
+    #[arg(long)]
     pub tip_command: Option<String>,
     #[arg(long)]
     pub tip_file: Option<PathBuf>,
@@ -275,4 +279,6 @@ pub struct CaptureArgs {
     pub max_capture_lag: String,
     #[arg(long, default_value = "unknown")]
     pub rusk_version: String,
+    #[arg(long)]
+    pub delete_candidate_after_publish: bool,
 }

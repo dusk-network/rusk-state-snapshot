@@ -31,6 +31,10 @@ pub async fn run(args: WatchArgs) -> Result<()> {
 
     loop {
         let now = Utc::now();
+        if retry_pending_candidates(&args, &mut journal, now).await? {
+            journal::save_atomic(&args.journal, &mut journal, now)?;
+        }
+
         let local_tip = tip_source.read().await.context("read local tip")?;
         let desired = desired_targets(now, &policy, genesis_time);
         let existing = existing_labels(&args.config, &args.source, &args.target, &desired).await?;
@@ -53,17 +57,8 @@ pub async fn run(args: WatchArgs) -> Result<()> {
             max_capture_lag,
             now,
         );
-        for (cutoff, targets) in grouped {
-            let labels: Vec<String> = targets.iter().map(|target| target.label.clone()).collect();
-            let result = capture::capture(capture_args_for_labels(&args, labels.clone(), cutoff))
-                .await
-                .with_context(|| format!("capture labels at cutoff {cutoff}"))?;
-            journal.record_captured(&labels, cutoff, result.snapshot_id, now);
-        }
-
-        maybe_capture_latest(
-            &args,
-            &mut journal,
+        let mut latest_due = latest_due(
+            &journal,
             &network_tip_source,
             &local_tip,
             latest_freshness_window,
@@ -71,6 +66,25 @@ pub async fn run(args: WatchArgs) -> Result<()> {
             now,
         )
         .await?;
+        let mut latest_was_coalesced = false;
+        for (cutoff, targets) in grouped {
+            let mut labels: Vec<String> =
+                targets.iter().map(|target| target.label.clone()).collect();
+            if latest_due {
+                labels.push("latest".to_string());
+                latest_was_coalesced = true;
+                latest_due = false;
+            }
+            capture_and_record(&args, &mut journal, labels, Some(cutoff), now)
+                .await
+                .with_context(|| format!("capture labels at cutoff {cutoff}"))?;
+        }
+
+        if latest_due && !latest_was_coalesced {
+            capture_and_record(&args, &mut journal, vec!["latest".to_string()], None, now)
+                .await
+                .context("capture latest")?;
+        }
 
         journal.last_seen_tip = Some(local_tip);
         journal::save_atomic(&args.journal, &mut journal, now)?;
@@ -89,6 +103,7 @@ pub fn classify_startup(
         if existing.contains(&target.label)
             || journal.has_captured_label(&target.label)
             || journal.has_missed_label(&target.label)
+            || journal.has_pending_label(&target.label)
         {
             continue;
         }
@@ -117,6 +132,7 @@ pub fn classify_crossings(
         if existing.contains(&target.label)
             || journal.has_captured_label(&target.label)
             || journal.has_missed_label(&target.label)
+            || journal.has_pending_label(&target.label)
         {
             continue;
         }
@@ -187,15 +203,14 @@ pub fn latest_interval_elapsed(
     }
 }
 
-async fn maybe_capture_latest(
-    args: &WatchArgs,
-    journal: &mut WatchJournal,
+async fn latest_due(
+    journal: &WatchJournal,
     network_tip_source: &TipSource,
     local_tip: &Tip,
     latest_freshness_window: Duration,
     latest_min_interval: Duration,
     now: DateTime<Utc>,
-) -> Result<()> {
+) -> Result<bool> {
     let freshness_reference = if network_tip_source.is_configured() {
         match network_tip_source.read().await {
             Ok(tip) => tip.block_timestamp,
@@ -212,19 +227,94 @@ async fn maybe_capture_latest(
         freshness_reference,
         latest_freshness_window,
     ) {
-        return Ok(());
+        return Ok(false);
     }
     if !latest_interval_elapsed(journal, latest_min_interval, now) {
-        return Ok(());
+        return Ok(false);
     }
-    let result = capture::capture(capture_args_for_latest(args))
-        .await
-        .context("capture latest")?;
-    journal.latest = Some(LatestEntry {
-        last_promoted_at: now,
-        last_snapshot_id: result.snapshot_id,
-    });
+    Ok(true)
+}
+
+async fn retry_pending_candidates(
+    args: &WatchArgs,
+    journal: &mut WatchJournal,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let mut changed = false;
+    for pending in journal.pending.clone() {
+        let candidate = match capture::load_publishable_candidate(&pending.candidate_path) {
+            Ok(candidate) => candidate,
+            Err(err) => {
+                eprintln!(
+                    "warning: pending candidate {} is not publishable yet: {err}",
+                    pending.snapshot_id
+                );
+                continue;
+            }
+        };
+        let capture_args = capture_args_for_candidate(args, &candidate);
+        match capture::publish_candidate_and_promote(&capture_args, &candidate).await {
+            Ok(result) => {
+                record_successful_candidate(journal, &candidate, result.snapshot_id, now);
+                changed = true;
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: pending candidate {} publish/promote retry failed: {err}",
+                    pending.snapshot_id
+                );
+            }
+        }
+    }
+    Ok(changed)
+}
+
+async fn capture_and_record(
+    args: &WatchArgs,
+    journal: &mut WatchJournal,
+    labels: Vec<String>,
+    cutoff: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let capture_args = capture_args_for_labels(args, labels, cutoff);
+    let candidate = capture::pack_stopped_candidate(&capture_args).await?;
+    journal.record_pending(
+        candidate.labels.clone(),
+        candidate.cutoff,
+        candidate.snapshot_id.clone(),
+        capture::candidate_marker_path(&candidate),
+        candidate.manifest_path_remote.clone(),
+        now,
+    );
+    journal::save_atomic(&args.journal, journal, now)?;
+    let result = capture::publish_candidate_and_promote(&capture_args, &candidate).await?;
+    record_successful_candidate(journal, &candidate, result.snapshot_id, now);
+    journal::save_atomic(&args.journal, journal, now)?;
     Ok(())
+}
+
+fn record_successful_candidate(
+    journal: &mut WatchJournal,
+    candidate: &capture::PackedCandidate,
+    snapshot_id: String,
+    now: DateTime<Utc>,
+) {
+    if let Some(cutoff) = candidate.cutoff {
+        let calendar_labels: Vec<String> = candidate
+            .labels
+            .iter()
+            .filter(|label| is_calendar_label(label))
+            .cloned()
+            .collect();
+        journal.record_captured(&calendar_labels, cutoff, snapshot_id.clone(), now);
+    }
+    if candidate.labels.iter().any(|label| label == "latest") {
+        journal.latest = Some(LatestEntry {
+            last_promoted_at: now,
+            last_snapshot_id: snapshot_id.clone(),
+        });
+    }
+    journal.remove_pending_snapshot(&candidate.snapshot_id);
 }
 
 async fn existing_labels(
@@ -249,16 +339,17 @@ async fn existing_labels(
 fn capture_args_for_labels(
     args: &WatchArgs,
     labels: Vec<String>,
-    cutoff: DateTime<Utc>,
+    cutoff: Option<DateTime<Utc>>,
 ) -> CaptureArgs {
     CaptureArgs {
         network: args.network.clone(),
         labels,
-        cutoff: Some(cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        cutoff: cutoff.map(|cutoff| cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
         config: args.config.clone(),
         target: args.target.clone(),
         state_dir: args.state_dir.clone(),
         chain_db_dir: args.chain_db_dir.clone(),
+        spool_dir: watch_spool_dir(args),
         tip_command: args.tip_command.clone(),
         tip_file: args.tip_file.clone(),
         manage_service: args.manage_service.clone(),
@@ -272,18 +363,25 @@ fn capture_args_for_labels(
         allow_stale_calendar: false,
         max_capture_lag: args.max_capture_lag.clone(),
         rusk_version: args.rusk_version.clone(),
+        delete_candidate_after_publish: false,
     }
 }
 
-fn capture_args_for_latest(args: &WatchArgs) -> CaptureArgs {
+fn capture_args_for_candidate(
+    args: &WatchArgs,
+    candidate: &capture::PackedCandidate,
+) -> CaptureArgs {
     CaptureArgs {
         network: args.network.clone(),
-        labels: vec!["latest".to_string()],
-        cutoff: None,
+        labels: candidate.labels.clone(),
+        cutoff: candidate
+            .cutoff
+            .map(|cutoff| cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
         config: args.config.clone(),
         target: args.target.clone(),
         state_dir: args.state_dir.clone(),
         chain_db_dir: args.chain_db_dir.clone(),
+        spool_dir: watch_spool_dir(args),
         tip_command: args.tip_command.clone(),
         tip_file: args.tip_file.clone(),
         manage_service: args.manage_service.clone(),
@@ -297,5 +395,16 @@ fn capture_args_for_latest(args: &WatchArgs) -> CaptureArgs {
         allow_stale_calendar: false,
         max_capture_lag: args.max_capture_lag.clone(),
         rusk_version: args.rusk_version.clone(),
+        delete_candidate_after_publish: false,
     }
+}
+
+fn watch_spool_dir(args: &WatchArgs) -> Option<std::path::PathBuf> {
+    args.spool_dir
+        .clone()
+        .or_else(|| args.journal.parent().map(|path| path.to_path_buf()))
+}
+
+fn is_calendar_label(label: &str) -> bool {
+    label.starts_with("daily:") || label.starts_with("monthly:") || label.starts_with("yearly:")
 }

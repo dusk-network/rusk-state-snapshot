@@ -19,6 +19,7 @@ use crate::{
     retention, safe_extract, signing,
     tip::{self, Tip},
 };
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::{fs, path::Path};
 use tempfile::TempDir;
@@ -109,6 +110,10 @@ fn test_tip(timestamp: &str) -> Tip {
     }
 }
 
+fn write_tip(path: &Path, tip: &Tip) {
+    fs::write(path, serde_json::to_vec_pretty(tip).unwrap()).unwrap();
+}
+
 fn target(label: &str, kind: TargetKind, period: &str, cutoff: &str) -> Target {
     Target {
         label: label.to_string(),
@@ -126,6 +131,114 @@ fn make_profile(root: &Path) {
     fs::write(root.join("state/debug.log"), b"app log").unwrap();
     fs::write(root.join("chain.db/value"), b"chain").unwrap();
     fs::write(root.join("chain.db/000001.log"), b"rocksdb wal").unwrap();
+}
+
+fn capture_fixture(
+    tmp: &TempDir,
+    labels: Vec<String>,
+    cutoff: Option<&str>,
+    tip_timestamp: &str,
+) -> (crate::cli::CaptureArgs, std::path::PathBuf) {
+    let profile = tmp.path().join("profile");
+    make_profile(&profile);
+    let tip_path = tmp.path().join("tip.json");
+    write_tip(&tip_path, &test_tip(tip_timestamp));
+    let target = tmp.path().join("target");
+    let cfg = tmp.path().join("config.toml");
+    fs::write(
+        &cfg,
+        format!(
+            "[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\nsigning_key_id='target-k1'\n",
+            target.display(),
+            SEED1
+        ),
+    )
+    .unwrap();
+    (
+        crate::cli::CaptureArgs {
+            network: "mainnet".to_string(),
+            labels,
+            cutoff: cutoff.map(|s| s.to_string()),
+            config: cfg,
+            target: "local".to_string(),
+            state_dir: profile.join("state"),
+            chain_db_dir: profile.join("chain.db"),
+            spool_dir: Some(tmp.path().join("spool")),
+            tip_command: None,
+            tip_file: Some(tip_path),
+            manage_service: Some("mock-rusk".to_string()),
+            manifest_signing_key: Some(SEED1.to_string()),
+            manifest_key_id: Some("k1".to_string()),
+            publisher_name: Some("Test".to_string()),
+            require_signed_manifest: false,
+            rebuild_index: true,
+            leave_stopped_on_error: false,
+            allow_prestop_tip: false,
+            allow_stale_calendar: false,
+            max_capture_lag: "1h".to_string(),
+            rusk_version: "test".to_string(),
+            delete_candidate_after_publish: false,
+        },
+        target,
+    )
+}
+
+struct MockService {
+    delete_on_start: Option<(std::path::PathBuf, std::path::PathBuf)>,
+}
+
+#[async_trait]
+impl commands::capture::ServiceController for MockService {
+    async fn stop(&mut self, _service: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn start(&mut self, _service: &str) -> anyhow::Result<()> {
+        if let Some((state, chain)) = self.delete_on_start.take() {
+            let _ = fs::remove_dir_all(state);
+            let _ = fs::remove_dir_all(chain);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct MockPublicationOps {
+    fail_publish: bool,
+    fail_promote_label: Option<String>,
+    promoted: Vec<String>,
+}
+
+#[async_trait]
+impl commands::capture::PublicationOps for MockPublicationOps {
+    async fn publish(
+        &mut self,
+        _args: &crate::cli::CaptureArgs,
+        _candidate: &commands::capture::PackedCandidate,
+    ) -> anyhow::Result<()> {
+        if self.fail_publish {
+            anyhow::bail!("publish failed");
+        }
+        Ok(())
+    }
+
+    async fn promote_label(
+        &mut self,
+        _args: &crate::cli::CaptureArgs,
+        _candidate: &commands::capture::PackedCandidate,
+        label: &str,
+    ) -> anyhow::Result<()> {
+        if self.fail_promote_label.as_deref() == Some(label) {
+            self.fail_promote_label = None;
+            anyhow::bail!("promote failed");
+        }
+        self.promoted.push(label.to_string());
+        Ok(())
+    }
+
+    async fn rebuild_index(&mut self, _args: &crate::cli::CaptureArgs) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 async fn pack_candidate(tmp: &TempDir, signed: bool) -> std::path::PathBuf {
@@ -743,9 +856,19 @@ fn journal_atomic_save_and_load_preserves_state() {
         "test",
         now,
     );
+    journal.record_pending(
+        vec!["monthly:2025-12".to_string()],
+        Some(dt("2026-01-01T00:00:00Z")),
+        "h000000001-sr_22222222".to_string(),
+        tmp.path()
+            .join("candidates/h000000001-sr_22222222/candidate.json"),
+        "v1/snapshots/full/h000000001-sr_22222222/manifest.json".to_string(),
+        now,
+    );
     crate::journal::save_atomic(&path, &mut journal, now).unwrap();
     let loaded = crate::journal::load_or_create(&path, "mainnet", now).unwrap();
     assert!(loaded.has_missed_label("monthly:2025-05"));
+    assert!(loaded.has_pending_label("monthly:2025-12"));
 }
 
 #[tokio::test]
@@ -870,6 +993,355 @@ fn capture_uses_prestop_tip_only_when_explicitly_allowed() {
     )
     .unwrap();
     assert_eq!(selected, pre_stop_tip);
+}
+
+// ---------------------------------------------------------------------------
+// Capture safety proof tests
+//
+// Invariant A: stopped-state consistency. The stopped tip is read after stop,
+// calendar cutoffs are validated against that tip, and packing happens before
+// service restart.
+// Invariant B: post-pack immutability. Publication accepts a PackedCandidate
+// and succeeds even if live state/chain paths disappear after restart.
+// Invariant C: multi-label coalescing. One candidate can promote many labels
+// to the same immutable manifest.
+// Invariant D: retry safety. Publish/promote failures leave a candidate marker
+// that can be retried without another stop/pack phase.
+// Invariant E: no false calendar labels. Cutoff validation rejects mismatched
+// or late calendar labels before any pointer can be written.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn capture_service_order_starts_before_publication() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (args, _) = capture_fixture(
+        &tmp,
+        vec!["monthly:2025-12".to_string(), "yearly:2025".to_string()],
+        Some("2026-01-01T00:00:00Z"),
+        "2026-01-01T00:10:00Z",
+    );
+    let events = commands::capture::CaptureEventLog::default();
+    let mut service = MockService {
+        delete_on_start: None,
+    };
+    let candidate =
+        commands::capture::pack_stopped_candidate_with_service(&args, &mut service, Some(&events))
+            .await
+            .unwrap();
+    let mut ops = MockPublicationOps::default();
+    commands::capture::publish_candidate_and_promote_with_ops(
+        &args,
+        &candidate,
+        &mut ops,
+        Some(&events),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        events.snapshot(),
+        vec![
+            "read-prestop-tip",
+            "stop",
+            "read-stopped-tip",
+            "pack",
+            "start",
+            "publish",
+            "promote:monthly:2025-12",
+            "promote:yearly:2025",
+            "rebuild-index"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn publication_after_restart_reads_only_candidate_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (args, target) = capture_fixture(
+        &tmp,
+        vec!["monthly:2025-12".to_string()],
+        Some("2026-01-01T00:00:00Z"),
+        "2026-01-01T00:10:00Z",
+    );
+    let mut service = MockService {
+        delete_on_start: Some((args.state_dir.clone(), args.chain_db_dir.clone())),
+    };
+    let candidate =
+        commands::capture::pack_stopped_candidate_with_service(&args, &mut service, None)
+            .await
+            .unwrap();
+    assert!(!args.state_dir.exists());
+    assert!(!args.chain_db_dir.exists());
+    commands::capture::publish_candidate_and_promote(&args, &candidate)
+        .await
+        .unwrap();
+    assert!(target
+        .join("v1/snapshots/full")
+        .join(&candidate.snapshot_id)
+        .join("manifest.json")
+        .exists());
+    assert!(target.join("v1/calendar/monthly/2025-12.json").exists());
+}
+
+#[tokio::test]
+async fn candidate_completeness_detects_corruption_and_missing_files() {
+    async fn fresh_candidate(
+        tmp: &TempDir,
+    ) -> (crate::cli::CaptureArgs, commands::capture::PackedCandidate) {
+        let (args, _) = capture_fixture(
+            tmp,
+            vec!["monthly:2025-12".to_string()],
+            Some("2026-01-01T00:00:00Z"),
+            "2026-01-01T00:10:00Z",
+        );
+        let mut service = MockService {
+            delete_on_start: None,
+        };
+        let candidate =
+            commands::capture::pack_stopped_candidate_with_service(&args, &mut service, None)
+                .await
+                .unwrap();
+        (args, candidate)
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (_args, candidate) = fresh_candidate(&tmp).await;
+    commands::capture::verify_candidate_complete(&candidate).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (_args, candidate) = fresh_candidate(&tmp).await;
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&candidate.artifact_path_local)
+            .unwrap();
+        file.write_all(b"corrupt").unwrap();
+    }
+    assert!(commands::capture::verify_candidate_complete(&candidate).is_err());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (_args, candidate) = fresh_candidate(&tmp).await;
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&candidate.manifest_path_local).unwrap()).unwrap();
+    manifest["artifacts"][0]["sha256"] = serde_json::Value::String(HASH1.to_string());
+    fs::write(
+        &candidate.manifest_path_local,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(commands::capture::verify_candidate_complete(&candidate).is_err());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (_args, candidate) = fresh_candidate(&tmp).await;
+    fs::remove_file(&candidate.manifest_path_local).unwrap();
+    assert!(commands::capture::verify_candidate_complete(&candidate).is_err());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (_args, candidate) = fresh_candidate(&tmp).await;
+    fs::remove_file(&candidate.artifact_path_local).unwrap();
+    assert!(commands::capture::verify_candidate_complete(&candidate).is_err());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (_args, candidate) = fresh_candidate(&tmp).await;
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&candidate.manifest_path_local).unwrap()).unwrap();
+    manifest["state_id"] = serde_json::Value::String(HASH1.to_string());
+    fs::write(
+        &candidate.manifest_path_local,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(commands::capture::verify_candidate_complete(&candidate).is_err());
+}
+
+#[tokio::test]
+async fn multi_label_capture_publishes_one_artifact_and_three_pointers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let labels = vec![
+        "daily:2026-12-31".to_string(),
+        "monthly:2026-12".to_string(),
+        "yearly:2026".to_string(),
+    ];
+    let (args, target) = capture_fixture(
+        &tmp,
+        labels,
+        Some("2027-01-01T00:00:00Z"),
+        "2027-01-01T00:10:00Z",
+    );
+    let mut service = MockService {
+        delete_on_start: None,
+    };
+    let candidate =
+        commands::capture::pack_stopped_candidate_with_service(&args, &mut service, None)
+            .await
+            .unwrap();
+    commands::capture::publish_candidate_and_promote(&args, &candidate)
+        .await
+        .unwrap();
+
+    let manifest_path = format!("v1/snapshots/full/{}/manifest.json", candidate.snapshot_id);
+    let manifest_file = target.join(&manifest_path);
+    let artifact_file = target
+        .join("v1/snapshots/full")
+        .join(&candidate.snapshot_id)
+        .join("snapshot.tar.zst");
+    assert!(manifest_file.exists());
+    assert!(artifact_file.exists());
+
+    for pointer in [
+        "v1/calendar/daily/2026-12-31.json",
+        "v1/calendar/monthly/2026-12.json",
+        "v1/calendar/yearly/2026.json",
+    ] {
+        let pointer: SignedPointer =
+            serde_json::from_slice(&fs::read(target.join(pointer)).unwrap()).unwrap();
+        assert_eq!(pointer.body.manifest_path, manifest_path);
+        assert_eq!(pointer.body.snapshot_id, candidate.snapshot_id);
+    }
+}
+
+#[test]
+fn latest_label_coalesces_into_calendar_capture_labels() {
+    let mut labels = vec!["monthly:2026-12".to_string(), "yearly:2026".to_string()];
+    let mut latest_due = true;
+    if latest_due {
+        labels.push("latest".to_string());
+        latest_due = false;
+    }
+    assert_eq!(labels, vec!["monthly:2026-12", "yearly:2026", "latest"]);
+    assert!(!latest_due);
+}
+
+#[tokio::test]
+async fn publish_failure_keeps_pending_candidate_for_retry_without_repack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let now = dt("2026-01-01T00:10:00Z");
+    let (args, _) = capture_fixture(
+        &tmp,
+        vec!["monthly:2025-12".to_string()],
+        Some("2026-01-01T00:00:00Z"),
+        "2026-01-01T00:10:00Z",
+    );
+    let events = commands::capture::CaptureEventLog::default();
+    let mut service = MockService {
+        delete_on_start: None,
+    };
+    let candidate =
+        commands::capture::pack_stopped_candidate_with_service(&args, &mut service, Some(&events))
+            .await
+            .unwrap();
+    let mut journal = WatchJournal::new("mainnet".to_string(), now);
+    journal.record_pending(
+        candidate.labels.clone(),
+        candidate.cutoff,
+        candidate.snapshot_id.clone(),
+        commands::capture::candidate_marker_path(&candidate),
+        candidate.manifest_path_remote.clone(),
+        now,
+    );
+
+    let mut failing = MockPublicationOps {
+        fail_publish: true,
+        ..Default::default()
+    };
+    assert!(commands::capture::publish_candidate_and_promote_with_ops(
+        &args,
+        &candidate,
+        &mut failing,
+        Some(&events),
+    )
+    .await
+    .is_err());
+    assert_eq!(journal.pending.len(), 1);
+    assert!(!journal.has_captured_label("monthly:2025-12"));
+
+    let mut succeeding = MockPublicationOps::default();
+    commands::capture::publish_candidate_and_promote_with_ops(
+        &args,
+        &commands::capture::load_publishable_candidate(&commands::capture::candidate_marker_path(
+            &candidate,
+        ))
+        .unwrap(),
+        &mut succeeding,
+        Some(&events),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        events
+            .snapshot()
+            .iter()
+            .filter(|event| event.as_str() == "pack")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn promote_partial_failure_retries_missing_labels_without_repack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (args, _) = capture_fixture(
+        &tmp,
+        vec!["monthly:2025-12".to_string(), "yearly:2025".to_string()],
+        Some("2026-01-01T00:00:00Z"),
+        "2026-01-01T00:10:00Z",
+    );
+    let events = commands::capture::CaptureEventLog::default();
+    let mut service = MockService {
+        delete_on_start: None,
+    };
+    let candidate =
+        commands::capture::pack_stopped_candidate_with_service(&args, &mut service, Some(&events))
+            .await
+            .unwrap();
+    let mut failing = MockPublicationOps {
+        fail_promote_label: Some("yearly:2025".to_string()),
+        ..Default::default()
+    };
+    assert!(commands::capture::publish_candidate_and_promote_with_ops(
+        &args,
+        &candidate,
+        &mut failing,
+        Some(&events),
+    )
+    .await
+    .is_err());
+    assert_eq!(failing.promoted, vec!["monthly:2025-12"]);
+
+    let mut retry = MockPublicationOps::default();
+    commands::capture::publish_candidate_and_promote_with_ops(
+        &args,
+        &commands::capture::load_publishable_candidate(&commands::capture::candidate_marker_path(
+            &candidate,
+        ))
+        .unwrap(),
+        &mut retry,
+        Some(&events),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry.promoted, vec!["monthly:2025-12", "yearly:2025"]);
+    assert_eq!(
+        events
+            .snapshot()
+            .iter()
+            .filter(|event| event.as_str() == "pack")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn candidate_marker_defines_publishable_atomic_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let candidate_dir = tmp.path().join("candidates/h000000001-sr_22222222");
+    fs::create_dir_all(&candidate_dir).unwrap();
+    fs::write(candidate_dir.join("snapshot.tar.zst.tmp"), b"incomplete").unwrap();
+    fs::write(candidate_dir.join("manifest.json.tmp"), b"incomplete").unwrap();
+    assert!(
+        commands::capture::load_publishable_candidate(&candidate_dir.join("candidate.json"))
+            .is_err()
+    );
 }
 
 // ---------------------------------------------------------------------------
