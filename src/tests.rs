@@ -1106,7 +1106,9 @@ async fn capture_service_order_starts_before_publication() {
             "stop",
             "read-stopped-tip",
             "pack",
+            "verify-light",
             "start",
+            "verify-complete",
             "publish",
             "promote:monthly:2025-12",
             "promote:yearly:2025",
@@ -1214,6 +1216,54 @@ async fn candidate_completeness_detects_corruption_and_missing_files() {
     )
     .unwrap();
     assert!(commands::capture::verify_candidate_complete(&candidate).is_err());
+}
+
+#[tokio::test]
+async fn stopped_phase_light_verification_allows_heavy_checks_after_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (args, _target) = capture_fixture(
+        &tmp,
+        vec!["monthly:2025-12".to_string()],
+        Some("2026-01-01T00:00:00Z"),
+        "2026-01-01T00:10:00Z",
+    );
+    let events = commands::capture::CaptureEventLog::default();
+    let mut service = MockService {
+        delete_on_start: None,
+    };
+    let candidate =
+        commands::capture::pack_stopped_candidate_with_service(&args, &mut service, Some(&events))
+            .await
+            .unwrap();
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&candidate.artifact_path_local)
+            .unwrap();
+        file.write_all(b"corrupt-after-restart").unwrap();
+    }
+    assert!(
+        commands::capture::verify_candidate_light(&candidate).is_ok(),
+        "light verification must not hash or extract the archive"
+    );
+    assert!(
+        commands::capture::publish_candidate_and_promote(&args, &candidate)
+            .await
+            .is_err(),
+        "online publication must still run complete verification"
+    );
+    assert_eq!(
+        events.snapshot(),
+        vec![
+            "read-prestop-tip",
+            "stop",
+            "read-stopped-tip",
+            "pack",
+            "verify-light",
+            "start"
+        ]
+    );
 }
 
 #[tokio::test]

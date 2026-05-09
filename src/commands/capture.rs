@@ -191,7 +191,8 @@ pub async fn pack_stopped_candidate_with_service(
 
         events.map(|e| e.record("pack"));
         let candidate = pack_candidate_files(args, stopped_tip, cutoff)?;
-        verify_candidate_complete(&candidate)?;
+        events.map(|e| e.record("verify-light"));
+        verify_candidate_light(&candidate)?;
         write_candidate_marker(&candidate)?;
         Ok(candidate)
     }
@@ -227,6 +228,7 @@ pub async fn publish_candidate_and_promote_with_ops(
     ops: &mut dyn PublicationOps,
     events: Option<&CaptureEventLog>,
 ) -> Result<CaptureResult> {
+    events.map(|e| e.record("verify-complete"));
     verify_candidate_complete(candidate)?;
     events.map(|e| e.record("publish"));
     ops.publish(args, candidate)
@@ -265,7 +267,7 @@ pub fn candidate_marker_path(candidate: &PackedCandidate) -> PathBuf {
     candidate.candidate_dir.join("candidate.json")
 }
 
-pub fn verify_candidate_complete(candidate: &PackedCandidate) -> Result<()> {
+pub fn verify_candidate_light(candidate: &PackedCandidate) -> Result<()> {
     if !candidate.candidate_dir.is_dir() {
         bail!(
             "candidate dir does not exist: {}",
@@ -293,6 +295,31 @@ pub fn verify_candidate_complete(candidate: &PackedCandidate) -> Result<()> {
     if artifact.path != "snapshot.tar.zst" {
         bail!("manifest artifact path must be snapshot.tar.zst");
     }
+    if candidate
+        .artifact_path_local
+        .file_name()
+        .and_then(|s| s.to_str())
+        != Some("snapshot.tar.zst")
+    {
+        bail!("candidate artifact must be final snapshot.tar.zst path");
+    }
+    if candidate
+        .manifest_path_local
+        .file_name()
+        .and_then(|s| s.to_str())
+        != Some("manifest.json")
+    {
+        bail!("candidate manifest must be final manifest.json path");
+    }
+    if candidate
+        .candidate_dir
+        .join("snapshot.tar.zst.tmp")
+        .exists()
+        || candidate.candidate_dir.join("manifest.json.tmp").exists()
+        || candidate.candidate_dir.join("candidate.json.tmp").exists()
+    {
+        bail!("candidate contains unfinished temp files");
+    }
     if manifest.body.height != candidate.stopped_tip.height {
         bail!("manifest height does not match stopped tip");
     }
@@ -310,7 +337,15 @@ pub fn verify_candidate_complete(candidate: &PackedCandidate) -> Result<()> {
     {
         bail!("manifest block_timestamp does not match stopped tip");
     }
+    Ok(())
+}
 
+pub fn verify_candidate_complete(candidate: &PackedCandidate) -> Result<()> {
+    verify_candidate_light(candidate)?;
+    let manifest_bytes = fs::read(&candidate.manifest_path_local)
+        .with_context(|| format!("read {}", candidate.manifest_path_local.display()))?;
+    let manifest: SignedManifest = serde_json::from_slice(&manifest_bytes)?;
+    let artifact = &manifest.body.artifacts[0];
     File::open(&candidate.artifact_path_local)
         .with_context(|| format!("open {}", candidate.artifact_path_local.display()))?;
     let hashes = hashing::hash_file(&candidate.artifact_path_local)?;
@@ -441,6 +476,7 @@ fn pack_candidate_files(
             .with_context(|| format!("remove stale {}", marker_path.display()))?;
     }
 
+    let state_id = archive::read_state_id(&args.state_dir)?;
     archive::create_snapshot_archive(&args.state_dir, &args.chain_db_dir, &artifact_tmp)?;
     sync_file(&artifact_tmp)?;
     fs::rename(&artifact_tmp, &artifact_path).with_context(|| {
@@ -453,7 +489,6 @@ fn pack_candidate_files(
     sync_dir(&candidate_dir);
 
     let hashes = hashing::hash_file(&artifact_path)?;
-    let state_id = read_archived_state_id(&artifact_path)?;
     let key_id = args
         .manifest_key_id
         .clone()

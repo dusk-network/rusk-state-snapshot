@@ -124,12 +124,14 @@ cargo run -- watch \
   --latest-min-interval 24h
 ```
 
-`capture` stops Rusk only long enough to write and verify a local immutable
-candidate. Once `snapshot.tar.zst`, `manifest.json`, and `candidate.json` are
-complete in the spool directory, Rusk is started again. Upload, promotion, and
-index rebuild then read only those candidate files, never the live `state/` or
-`chain.db/` paths. All provided labels are promoted to the same immutable
-manifest:
+`capture` stops Rusk only long enough to write a local immutable candidate and
+run light structural verification. Once `snapshot.tar.zst`, `manifest.json`,
+and `candidate.json` are complete in the spool directory, Rusk is started
+again. Full candidate verification, including artifact hashing and archive
+safety validation, happens after restart and reads only those candidate files,
+never the live `state/` or `chain.db/` paths. Upload, promotion, and index
+rebuild also run after restart. All provided labels are promoted to the same
+immutable manifest:
 
 ```sh
 cargo run -- capture \
