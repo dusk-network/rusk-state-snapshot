@@ -268,6 +268,44 @@ pub fn candidate_marker_path(candidate: &PackedCandidate) -> PathBuf {
 }
 
 pub fn verify_candidate_light(candidate: &PackedCandidate) -> Result<()> {
+    let expected_id = snapshot_id(
+        candidate.stopped_tip.height,
+        &candidate.stopped_tip.state_root.to_lowercase(),
+    );
+    if candidate.snapshot_id != expected_id {
+        bail!(
+            "candidate snapshot_id {} does not match stopped tip-derived id {expected_id}",
+            candidate.snapshot_id
+        );
+    }
+    let expected_remote = format!("v1/snapshots/full/{expected_id}/manifest.json");
+    if candidate.manifest_path_remote != expected_remote {
+        bail!(
+            "candidate remote manifest path {} does not match expected {expected_remote}",
+            candidate.manifest_path_remote
+        );
+    }
+    if candidate.candidate_dir.file_name().and_then(|s| s.to_str())
+        != Some(candidate.snapshot_id.as_str())
+    {
+        bail!("candidate dir basename must match snapshot_id");
+    }
+    let expected_artifact = candidate.candidate_dir.join("snapshot.tar.zst");
+    if candidate.artifact_path_local != expected_artifact {
+        bail!(
+            "candidate artifact path {} does not match expected {}",
+            candidate.artifact_path_local.display(),
+            expected_artifact.display()
+        );
+    }
+    let expected_manifest = candidate.candidate_dir.join("manifest.json");
+    if candidate.manifest_path_local != expected_manifest {
+        bail!(
+            "candidate manifest path {} does not match expected {}",
+            candidate.manifest_path_local.display(),
+            expected_manifest.display()
+        );
+    }
     if !candidate.candidate_dir.is_dir() {
         bail!(
             "candidate dir does not exist: {}",

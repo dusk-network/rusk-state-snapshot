@@ -1219,6 +1219,45 @@ async fn candidate_completeness_detects_corruption_and_missing_files() {
 }
 
 #[tokio::test]
+async fn candidate_light_verification_rejects_inconsistent_marker_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (args, _) = capture_fixture(
+        &tmp,
+        vec!["monthly:2025-12".to_string()],
+        Some("2026-01-01T00:00:00Z"),
+        "2026-01-01T00:10:00Z",
+    );
+    let mut service = MockService {
+        delete_on_start: None,
+    };
+    let candidate =
+        commands::capture::pack_stopped_candidate_with_service(&args, &mut service, None)
+            .await
+            .unwrap();
+    commands::capture::verify_candidate_light(&candidate).unwrap();
+
+    let mut bad = candidate.clone();
+    bad.snapshot_id = "h000000999-sr_badbadba".to_string();
+    assert!(commands::capture::verify_candidate_light(&bad).is_err());
+
+    let mut bad = candidate.clone();
+    bad.manifest_path_remote = "v1/snapshots/full/h000000999-sr_badbadba/manifest.json".to_string();
+    assert!(commands::capture::verify_candidate_light(&bad).is_err());
+
+    let mut bad = candidate.clone();
+    bad.candidate_dir = candidate.candidate_dir.with_file_name("different-id");
+    assert!(commands::capture::verify_candidate_light(&bad).is_err());
+
+    let mut bad = candidate.clone();
+    bad.artifact_path_local = candidate.candidate_dir.join("other-snapshot.tar.zst");
+    assert!(commands::capture::verify_candidate_light(&bad).is_err());
+
+    let mut bad = candidate.clone();
+    bad.manifest_path_local = candidate.candidate_dir.join("other-manifest.json");
+    assert!(commands::capture::verify_candidate_light(&bad).is_err());
+}
+
+#[tokio::test]
 async fn stopped_phase_light_verification_allows_heavy_checks_after_restart() {
     let tmp = tempfile::tempdir().unwrap();
     let (args, _target) = capture_fixture(
