@@ -2,13 +2,16 @@ use crate::{
     archive,
     cli::{CaptureArgs, PromoteArgs, PublishArgs, RebuildIndexArgs},
     commands::{index, promote, publish},
+    config::Config,
     hashing,
     manifest::{
         snapshot_id, Artifact, ComponentEntry, Components, ManifestBody, Publisher, SignedManifest,
         MANIFEST_FORMAT,
     },
+    object_store,
+    pointer::{pointer_path, SignedPointer},
     retention::parse_duration,
-    signing,
+    safe_extract, signing,
     tip::{Tip, TipSource},
 };
 use anyhow::{bail, Context, Result};
@@ -109,6 +112,11 @@ impl PublicationOps for CommandPublicationOps {
         candidate: &PackedCandidate,
         label: &str,
     ) -> Result<()> {
+        if pointer_already_references_candidate(args, label, &candidate.manifest_path_remote)
+            .await?
+        {
+            return Ok(());
+        }
         promote::run(PromoteArgs {
             target: args.target.clone(),
             config: args.config.clone(),
@@ -315,11 +323,28 @@ pub fn verify_candidate_complete(candidate: &PackedCandidate) -> Result<()> {
     if hashes.blake3 != artifact.blake3 {
         bail!("candidate artifact blake3 does not match manifest");
     }
+    safe_extract::validate_archive_safe(&candidate.artifact_path_local)
+        .context("candidate archive safety validation")?;
     let archived_state_id = read_archived_state_id(&candidate.artifact_path_local)?;
     if archived_state_id != manifest.body.state_id {
         bail!("archived state/state.id does not match manifest state_id");
     }
     Ok(())
+}
+
+async fn pointer_already_references_candidate(
+    args: &CaptureArgs,
+    label: &str,
+    manifest_path_remote: &str,
+) -> Result<bool> {
+    let cfg = Config::load(&args.config)?;
+    let store = object_store::from_endpoint(cfg.target(&args.target)?)?;
+    let path = pointer_path(label)?;
+    if !store.exists(&path).await? {
+        return Ok(false);
+    }
+    let pointer: SignedPointer = serde_json::from_slice(&store.get(&path).await?)?;
+    Ok(pointer.body.manifest_path == manifest_path_remote)
 }
 
 pub fn validate_tip_for_labels(

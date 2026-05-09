@@ -168,10 +168,19 @@ The candidate spool layout is:
       candidate.json
 ```
 
-`candidate.json` is the publishable marker. Watch records packed candidates as
-pending in its journal before publishing; if publish or promotion fails after
-Rusk has restarted, the next watch iteration retries from the same candidate
-without stopping Rusk or repacking.
+`candidate.json` is the publishable marker. Watch scans the spool for valid
+candidate markers before classifying cutoffs, so a crash after packing but
+before the journal update can still recover the candidate instead of marking the
+label missed. Watch records packed candidates as pending in its journal before
+publishing; if publish or promotion fails after Rusk has restarted, the next
+watch iteration retries from the same candidate without stopping Rusk or
+repacking. During retry, labels whose pointers already reference the candidate
+manifest are skipped; this is especially important for `latest`, because
+rewriting an already-promoted `latest` would also rewrite `previous`.
+
+Watch deletes candidate directories after successful publication by default.
+Manual `capture` keeps the candidate unless `--delete-candidate-after-publish`
+is provided.
 
 ## Scope
 

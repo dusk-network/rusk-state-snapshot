@@ -12,7 +12,7 @@ use crate::{
         file::FileStore,
         http,
         s3::{self, S3Store, UploadPlan},
-        ObjectStore,
+        ObjectMeta, ObjectStore,
     },
     planner::{self, Target, TargetKind},
     pointer::{PointerBody, SignedPointer, POINTER_FORMAT},
@@ -21,7 +21,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use std::{fs, path::Path};
+use std::{collections::HashMap, fs, path::Path, sync::Mutex};
 use tempfile::TempDir;
 
 const SEED1: &str = "0101010101010101010101010101010101010101010101010101010101010101";
@@ -207,6 +207,68 @@ struct MockPublicationOps {
     fail_publish: bool,
     fail_promote_label: Option<String>,
     promoted: Vec<String>,
+}
+
+struct CorruptingStore {
+    objects: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+#[async_trait]
+impl ObjectStore for CorruptingStore {
+    async fn get(&self, path: &str) -> anyhow::Result<Vec<u8>> {
+        self.objects
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing {path}"))
+    }
+
+    async fn put(&self, path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), bytes.to_vec());
+        Ok(())
+    }
+
+    async fn put_file(&self, path: &str, source: &Path) -> anyhow::Result<()> {
+        let mut bytes = fs::read(source)?;
+        bytes.push(0);
+        self.objects.lock().unwrap().insert(path.to_string(), bytes);
+        Ok(())
+    }
+
+    async fn get_to_file(&self, path: &str, destination: &Path) -> anyhow::Result<()> {
+        fs::write(destination, self.get(path).await?)?;
+        Ok(())
+    }
+
+    async fn stat(&self, path: &str) -> anyhow::Result<Option<ObjectMeta>> {
+        Ok(self
+            .objects
+            .lock()
+            .unwrap()
+            .get(path)
+            .map(|bytes| ObjectMeta {
+                path: path.to_string(),
+                size: bytes.len() as u64,
+                modified: None,
+            }))
+    }
+
+    async fn exists(&self, path: &str) -> anyhow::Result<bool> {
+        Ok(self.objects.lock().unwrap().contains_key(path))
+    }
+
+    async fn list_prefix(&self, _prefix: &str) -> anyhow::Result<Vec<ObjectMeta>> {
+        Ok(Vec::new())
+    }
+
+    async fn delete(&self, path: &str) -> anyhow::Result<()> {
+        self.objects.lock().unwrap().remove(path);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1200,6 +1262,113 @@ async fn multi_label_capture_publishes_one_artifact_and_three_pointers() {
     }
 }
 
+#[tokio::test]
+async fn retry_skips_latest_that_already_points_to_candidate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (args, target) = capture_fixture(
+        &tmp,
+        vec!["latest".to_string()],
+        None,
+        "2026-01-01T00:10:00Z",
+    );
+    let mut service = MockService {
+        delete_on_start: None,
+    };
+    let candidate =
+        commands::capture::pack_stopped_candidate_with_service(&args, &mut service, None)
+            .await
+            .unwrap();
+
+    commands::capture::publish_candidate_and_promote(&args, &candidate)
+        .await
+        .unwrap();
+    commands::capture::publish_candidate_and_promote(&args, &candidate)
+        .await
+        .unwrap();
+
+    assert!(target.join("v1/pointers/latest.json").exists());
+    assert!(
+        !target.join("v1/pointers/previous.json").exists(),
+        "retrying an already-promoted latest must not rewrite previous"
+    );
+}
+
+#[tokio::test]
+async fn watch_imports_orphaned_spool_candidate_before_marking_missed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let now = dt("2026-01-01T02:00:00Z");
+    let (capture_args, _target) = capture_fixture(
+        &tmp,
+        vec!["monthly:2025-12".to_string()],
+        Some("2026-01-01T00:00:00Z"),
+        "2026-01-01T00:10:00Z",
+    );
+    let mut service = MockService {
+        delete_on_start: None,
+    };
+    let candidate =
+        commands::capture::pack_stopped_candidate_with_service(&capture_args, &mut service, None)
+            .await
+            .unwrap();
+    let mut journal = WatchJournal::new("mainnet".to_string(), now);
+    journal.record_missed(
+        "monthly:2025-12".to_string(),
+        dt("2026-01-01T00:00:00Z"),
+        "simulated crash recovery race",
+        now,
+    );
+    let watch_args = crate::cli::WatchArgs {
+        network: "mainnet".to_string(),
+        policy: tmp.path().join("retention.toml"),
+        config: capture_args.config.clone(),
+        source: "local".to_string(),
+        target: "local".to_string(),
+        state_dir: capture_args.state_dir.clone(),
+        chain_db_dir: capture_args.chain_db_dir.clone(),
+        tip_command: None,
+        tip_file: capture_args.tip_file.clone(),
+        network_tip_command: None,
+        network_tip_file: None,
+        manage_service: capture_args.manage_service.clone(),
+        manifest_signing_key: capture_args.manifest_signing_key.clone(),
+        manifest_key_id: capture_args.manifest_key_id.clone(),
+        publisher_name: capture_args.publisher_name.clone(),
+        require_signed_manifest: false,
+        journal: tmp.path().join("watch.json"),
+        spool_dir: capture_args.spool_dir.clone(),
+        poll_interval: "1s".to_string(),
+        max_capture_lag: "1h".to_string(),
+        latest_freshness_window: "24h".to_string(),
+        latest_min_interval: "24h".to_string(),
+        genesis_time: None,
+        rusk_version: "test".to_string(),
+        allow_prestop_tip: false,
+    };
+
+    assert!(commands::watch::import_spooled_candidates(&watch_args, &mut journal, now).unwrap());
+    assert!(journal.has_pending_label("monthly:2025-12"));
+    assert!(!journal.has_missed_label("monthly:2025-12"));
+
+    let desired = vec![target(
+        "monthly:2025-12",
+        TargetKind::Monthly,
+        "2025-12",
+        "2026-01-01T00:00:00Z",
+    )];
+    commands::watch::classify_startup(
+        &mut journal,
+        &desired,
+        &std::collections::BTreeSet::new(),
+        &test_tip("2026-01-01T02:00:00Z"),
+        now,
+    );
+    assert!(!journal.has_missed_label("monthly:2025-12"));
+    assert_eq!(
+        journal.pending[0].candidate_path,
+        commands::capture::candidate_marker_path(&candidate)
+    );
+}
+
 #[test]
 fn latest_label_coalesces_into_calendar_capture_labels() {
     let mut labels = vec!["monthly:2026-12".to_string(), "yearly:2026".to_string()];
@@ -1342,6 +1511,86 @@ fn candidate_marker_defines_publishable_atomic_boundary() {
         commands::capture::load_publishable_candidate(&candidate_dir.join("candidate.json"))
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn candidate_verification_rejects_unsafe_archive_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_args, candidate) = {
+        let (args, _) = capture_fixture(
+            &tmp,
+            vec!["monthly:2025-12".to_string()],
+            Some("2026-01-01T00:00:00Z"),
+            "2026-01-01T00:10:00Z",
+        );
+        let mut service = MockService {
+            delete_on_start: None,
+        };
+        let candidate =
+            commands::capture::pack_stopped_candidate_with_service(&args, &mut service, None)
+                .await
+                .unwrap();
+        (args, candidate)
+    };
+
+    {
+        let file = fs::File::create(&candidate.artifact_path_local).unwrap();
+        let encoder = zstd::Encoder::new(file, 0).unwrap();
+        let mut tar = tar::Builder::new(encoder);
+        let state_id = [7u8; 32];
+        let mut header = tar::Header::new_gnu();
+        header.set_size(state_id.len() as u64);
+        header.set_cksum();
+        tar.append_data(&mut header, "state/state.id", &state_id[..])
+            .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_cksum();
+        tar.append_link(&mut header, "state/escape", "../../outside")
+            .unwrap();
+        let encoder = tar.into_inner().unwrap();
+        encoder.finish().unwrap();
+    }
+    let hashes = hashing::hash_file(&candidate.artifact_path_local).unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&candidate.manifest_path_local).unwrap()).unwrap();
+    manifest["artifacts"][0]["size"] = serde_json::Value::Number(hashes.size.into());
+    manifest["artifacts"][0]["sha256"] = serde_json::Value::String(hashes.sha256);
+    manifest["artifacts"][0]["blake3"] = serde_json::Value::String(hashes.blake3);
+    fs::write(
+        &candidate.manifest_path_local,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let err = commands::capture::verify_candidate_complete(&candidate)
+        .expect_err("unsafe archive path must be rejected");
+    assert!(err.to_string().contains("archive safety"), "{err}");
+}
+
+#[tokio::test]
+async fn publish_deletes_new_bad_artifact_after_post_upload_verification_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("snapshot.tar.zst");
+    fs::write(&source, b"artifact").unwrap();
+    let hashes = hashing::hash_file(&source).unwrap();
+    let store = CorruptingStore {
+        objects: Mutex::new(HashMap::new()),
+    };
+    let err = commands::publish::put_immutable_file(
+        &store,
+        "v1/snapshots/full/bad/snapshot.tar.zst",
+        &source,
+        &hashes,
+    )
+    .await
+    .expect_err("corrupting store must fail post-upload verification");
+    assert!(err.to_string().contains("mismatch"), "{err}");
+    assert!(!store
+        .exists("v1/snapshots/full/bad/snapshot.tar.zst")
+        .await
+        .unwrap());
 }
 
 // ---------------------------------------------------------------------------

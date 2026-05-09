@@ -31,6 +31,9 @@ pub async fn run(args: WatchArgs) -> Result<()> {
 
     loop {
         let now = Utc::now();
+        if import_spooled_candidates(&args, &mut journal, now)? {
+            journal::save_atomic(&args.journal, &mut journal, now)?;
+        }
         if retry_pending_candidates(&args, &mut journal, now).await? {
             journal::save_atomic(&args.journal, &mut journal, now)?;
         }
@@ -235,7 +238,7 @@ async fn latest_due(
     Ok(true)
 }
 
-async fn retry_pending_candidates(
+pub(crate) async fn retry_pending_candidates(
     args: &WatchArgs,
     journal: &mut WatchJournal,
     now: DateTime<Utc>,
@@ -265,6 +268,67 @@ async fn retry_pending_candidates(
                 );
             }
         }
+    }
+    Ok(changed)
+}
+
+pub(crate) fn import_spooled_candidates(
+    args: &WatchArgs,
+    journal: &mut WatchJournal,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let Some(spool_dir) = watch_spool_dir(args) else {
+        return Ok(false);
+    };
+    let candidates_dir = spool_dir.join("candidates");
+    if !candidates_dir.is_dir() {
+        return Ok(false);
+    }
+    let mut changed = false;
+    for entry in std::fs::read_dir(&candidates_dir)
+        .with_context(|| format!("read {}", candidates_dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let marker = entry.path().join("candidate.json");
+        if !marker.is_file() {
+            continue;
+        }
+        let candidate = match capture::load_publishable_candidate(&marker) {
+            Ok(candidate) => candidate,
+            Err(err) => {
+                eprintln!(
+                    "warning: spooled candidate marker {} is not publishable: {err}",
+                    marker.display()
+                );
+                continue;
+            }
+        };
+        if candidate
+            .labels
+            .iter()
+            .any(|label| journal.has_pending_label(label))
+        {
+            continue;
+        }
+        if candidate
+            .labels
+            .iter()
+            .all(|label| journal.has_captured_label(label))
+        {
+            continue;
+        }
+        journal.record_pending(
+            candidate.labels.clone(),
+            candidate.cutoff,
+            candidate.snapshot_id.clone(),
+            marker,
+            candidate.manifest_path_remote.clone(),
+            now,
+        );
+        changed = true;
     }
     Ok(changed)
 }
@@ -363,7 +427,7 @@ fn capture_args_for_labels(
         allow_stale_calendar: false,
         max_capture_lag: args.max_capture_lag.clone(),
         rusk_version: args.rusk_version.clone(),
-        delete_candidate_after_publish: false,
+        delete_candidate_after_publish: true,
     }
 }
 
@@ -395,7 +459,7 @@ fn capture_args_for_candidate(
         allow_stale_calendar: false,
         max_capture_lag: args.max_capture_lag.clone(),
         rusk_version: args.rusk_version.clone(),
-        delete_candidate_after_publish: false,
+        delete_candidate_after_publish: true,
     }
 }
 

@@ -138,6 +138,8 @@ impl WatchJournal {
     ) {
         self.pending
             .retain(|entry| !entry.labels.iter().any(|label| labels.contains(label)));
+        self.missed
+            .retain(|entry| !labels.iter().any(|label| label == &entry.label));
         self.pending.push(PendingCandidateEntry {
             labels,
             cutoff,

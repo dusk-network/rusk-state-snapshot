@@ -55,12 +55,13 @@ async fn put_immutable_bytes(
     store.put(path, bytes).await?;
     let written = store.get(path).await?;
     if written != bytes {
+        let _ = store.delete(path).await;
         bail!("post-write read-back mismatch for {path}");
     }
     Ok(())
 }
 
-async fn put_immutable_file(
+pub(crate) async fn put_immutable_file(
     store: &dyn object_store::ObjectStore,
     path: &str,
     source: &Path,
@@ -82,11 +83,12 @@ async fn put_immutable_file(
     // the object back into a temp file. This avoids server-side multipart copy
     // and keeps memory bounded for large archives.
     store.put_file(path, source).await?;
-    let final_meta = store
-        .stat(path)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("final object missing after upload: {path}"))?;
+    let final_meta = store.stat(path).await?.ok_or_else(|| {
+        let path = path.to_string();
+        anyhow::anyhow!("final object missing after upload: {path}")
+    })?;
     if final_meta.size != expected.size {
+        let _ = store.delete(path).await;
         bail!(
             "final object size mismatch for {path}: expected {}, got {}",
             expected.size,
@@ -97,6 +99,7 @@ async fn put_immutable_file(
     store.get_to_file(path, tmp.path()).await?;
     let written = hashing::hash_file(tmp.path())?;
     if written.sha256 != expected.sha256 || written.blake3 != expected.blake3 {
+        let _ = store.delete(path).await;
         bail!("post-upload hash mismatch for {path}");
     }
     Ok(())
