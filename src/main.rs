@@ -1,4 +1,5 @@
 mod archive;
+mod archive_blob;
 mod cli;
 mod commands;
 mod config;

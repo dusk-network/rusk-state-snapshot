@@ -22,6 +22,20 @@ pub enum Command {
     Plan(PlanArgs),
     Watch(WatchArgs),
     Capture(CaptureArgs),
+    /// Experimental archive/blob POC: pack a signed blob range from local block descriptors.
+    BlobsPackRange(BlobsPackRangeArgs),
+    /// Experimental archive/blob POC: publish a packed blob range and its objects.
+    BlobsPublishRange(BlobsPublishRangeArgs),
+    /// Experimental archive/blob POC: write a coverage manifest from packed range manifests.
+    BlobsWriteCoverage(BlobsWriteCoverageArgs),
+    /// Experimental archive/blob POC: verify signed contiguous blob coverage.
+    BlobsVerifyCoverage(BlobsVerifyCoverageArgs),
+    /// Experimental archive/blob POC: pack an archive checkpoint artifact and manifest.
+    ArchivePack(ArchivePackArgs),
+    /// Experimental archive/blob POC: verify archive/state/blob checkpoint completeness.
+    VerifyArchiveComplete(VerifyArchiveCompleteArgs),
+    /// Experimental archive/blob POC: restore matching state and archive artifacts.
+    ArchiveRestoreComplete(ArchiveRestoreCompleteArgs),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -281,4 +295,128 @@ pub struct CaptureArgs {
     pub rusk_version: String,
     #[arg(long)]
     pub delete_candidate_after_publish: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BlobsPackRangeArgs {
+    #[arg(long)]
+    pub network: String,
+    #[arg(long)]
+    pub from_height: u64,
+    #[arg(long)]
+    pub to_height: u64,
+    /// POC input directory. Expects blob-blocks/h#########.json descriptors.
+    #[arg(long)]
+    pub chain_db_dir: PathBuf,
+    #[arg(long)]
+    pub out: PathBuf,
+    #[arg(long)]
+    pub previous_range_sha256: Option<String>,
+    #[arg(long)]
+    pub signing_key: Option<String>,
+    #[arg(long)]
+    pub key_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct BlobsPublishRangeArgs {
+    #[arg(long)]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub target: String,
+    pub manifest: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct BlobsWriteCoverageArgs {
+    #[arg(long)]
+    pub network: String,
+    #[arg(long)]
+    pub out: PathBuf,
+    #[arg(long)]
+    pub signing_key: Option<String>,
+    #[arg(long)]
+    pub key_id: Option<String>,
+    pub ranges: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct BlobsVerifyCoverageArgs {
+    #[arg(long)]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub source: String,
+    #[arg(long)]
+    pub coverage_manifest: String,
+    #[arg(long)]
+    pub from_height: u64,
+    #[arg(long)]
+    pub to_height: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct ArchivePackArgs {
+    #[arg(long)]
+    pub network: String,
+    #[arg(long)]
+    pub archive_dir: PathBuf,
+    #[arg(long)]
+    pub height: u64,
+    #[arg(long)]
+    pub block_hash: String,
+    #[arg(long)]
+    pub state_root: String,
+    #[arg(long)]
+    pub block_timestamp: String,
+    #[arg(long)]
+    pub state_manifest_path: String,
+    #[arg(long)]
+    pub state_manifest_sha256: String,
+    #[arg(long)]
+    pub blob_coverage_path: String,
+    #[arg(long)]
+    pub blob_coverage_sha256: String,
+    #[arg(long)]
+    pub blob_coverage_from_height: u64,
+    #[arg(long)]
+    pub blob_coverage_to_height: u64,
+    #[arg(long)]
+    pub blob_coverage_to_block_hash: String,
+    #[arg(long)]
+    pub out: PathBuf,
+    #[arg(long)]
+    pub signing_key: Option<String>,
+    #[arg(long)]
+    pub key_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct VerifyArchiveCompleteArgs {
+    #[arg(long)]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub source: String,
+    #[arg(long)]
+    pub archive_manifest: String,
+    #[arg(long)]
+    pub target_height: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct ArchiveRestoreCompleteArgs {
+    #[arg(long)]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub source: String,
+    #[arg(long)]
+    pub archive_manifest: String,
+    #[arg(long)]
+    pub target_height: u64,
+    #[arg(long)]
+    pub destination_profile: PathBuf,
+    #[arg(long)]
+    pub archive_dir: PathBuf,
+    /// Replace existing restored state/archive directories. Intended for POC restore tests only.
+    #[arg(long)]
+    pub replace: bool,
 }

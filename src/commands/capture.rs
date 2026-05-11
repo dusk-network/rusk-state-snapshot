@@ -57,8 +57,15 @@ impl CaptureEventLog {
         self.events.lock().unwrap().push(event.into());
     }
 
+    #[allow(dead_code)]
     pub fn snapshot(&self) -> Vec<String> {
         self.events.lock().unwrap().clone()
+    }
+}
+
+fn record_event(events: Option<&CaptureEventLog>, event: impl Into<String>) {
+    if let Some(events) = events {
+        events.record(event);
     }
 }
 
@@ -168,14 +175,14 @@ pub async fn pack_stopped_candidate_with_service(
     let max_capture_lag = parse_duration(&args.max_capture_lag)?;
     let tip_source = TipSource::required(args.tip_command.clone(), args.tip_file.clone(), "tip")?;
 
-    events.map(|e| e.record("read-prestop-tip"));
+    record_event(events, "read-prestop-tip");
     let pre_stop_tip = tip_source.read().await?;
 
-    events.map(|e| e.record("stop"));
+    record_event(events, "stop");
     service.stop(service_name).await?;
 
     let packed = async {
-        events.map(|e| e.record("read-stopped-tip"));
+        record_event(events, "read-stopped-tip");
         let stopped_tip = select_stopped_tip(
             pre_stop_tip,
             tip_source.read().await,
@@ -189,9 +196,9 @@ pub async fn pack_stopped_candidate_with_service(
             args.allow_stale_calendar,
         )?;
 
-        events.map(|e| e.record("pack"));
+        record_event(events, "pack");
         let candidate = pack_candidate_files(args, stopped_tip, cutoff)?;
-        events.map(|e| e.record("verify-light"));
+        record_event(events, "verify-light");
         verify_candidate_light(&candidate)?;
         write_candidate_marker(&candidate)?;
         Ok(candidate)
@@ -200,13 +207,13 @@ pub async fn pack_stopped_candidate_with_service(
 
     match packed {
         Ok(candidate) => {
-            events.map(|e| e.record("start"));
+            record_event(events, "start");
             service.start(service_name).await?;
             Ok(candidate)
         }
         Err(err) => {
             if !args.leave_stopped_on_error {
-                events.map(|e| e.record("start"));
+                record_event(events, "start");
                 let _ = service.start(service_name).await;
             }
             Err(err)
@@ -228,21 +235,21 @@ pub async fn publish_candidate_and_promote_with_ops(
     ops: &mut dyn PublicationOps,
     events: Option<&CaptureEventLog>,
 ) -> Result<CaptureResult> {
-    events.map(|e| e.record("verify-complete"));
+    record_event(events, "verify-complete");
     verify_candidate_complete(candidate)?;
-    events.map(|e| e.record("publish"));
+    record_event(events, "publish");
     ops.publish(args, candidate)
         .await
         .context("publish capture snapshot")?;
 
     for label in &candidate.labels {
-        events.map(|e| e.record(format!("promote:{label}")));
+        record_event(events, format!("promote:{label}"));
         ops.promote_label(args, candidate, label)
             .await
             .with_context(|| format!("promote label {label}"))?;
     }
     if args.rebuild_index {
-        events.map(|e| e.record("rebuild-index"));
+        record_event(events, "rebuild-index");
         ops.rebuild_index(args).await.context("rebuild index")?;
     }
     if args.delete_candidate_after_publish {

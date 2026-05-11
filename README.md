@@ -265,6 +265,101 @@ objects older than the grace period, and deletes them only with `--delete`. It
 never touches local node state. It prunes stale pointers and unreferenced
 artifacts; it does not create daily, monthly, yearly, or latest labels.
 
+On the experimental `poc/archive-blob-retention` branch, `gc` also understands
+archive/blob reachability. A retained archive manifest pins its archive artifact,
+the matching state snapshot manifest and artifact, the blob coverage manifest,
+the signed blob range manifests, and every referenced content-addressed blob
+object. This is branch-local POC behavior and does not make archive/blob capture
+part of the default provisioner snapshot path.
+
+## Experimental Archive/Blob POC
+
+This branch contains local-only proof plumbing for archive/blob retention. State
+snapshots remain the existing provisioner snapshots. Archive snapshots are
+separate checkpoint-aligned artifacts under `v1/archive/checkpoints/...`, and
+blob data is stored independently under `v1/blobs/objects/...` by content hash.
+Blob completeness is proven by signed contiguous range manifests plus a signed
+coverage manifest; archive completeness is true only when the archive artifact,
+matching state snapshot, and blob coverage all verify.
+
+The POC commands are intentionally separate:
+
+```sh
+cargo run -- blobs-pack-range \
+  --network localnet \
+  --from-height 0 \
+  --to-height 49 \
+  --chain-db-dir ./target/poc-chain.db \
+  --out ./target/archive-blob-poc
+
+cargo run -- blobs-write-coverage \
+  --network localnet \
+  --out ./target/archive-blob-poc \
+  ./target/archive-blob-poc/v1/blobs/ranges/h000000000-h000000049/blob-range.json
+
+cargo run -- blobs-publish-range \
+  --config ./examples/config.example.toml \
+  --target local_mainnet \
+  ./target/archive-blob-poc/v1/blobs/ranges/h000000000-h000000049/blob-range.json
+
+cargo run -- blobs-verify-coverage \
+  --config ./examples/config.example.toml \
+  --source local_mainnet \
+  --coverage-manifest v1/blobs/coverage/h000000049-b_00000000.json \
+  --from-height 0 \
+  --to-height 49
+
+cargo run -- archive-pack \
+  --network localnet \
+  --archive-dir ./target/archive-node/archive \
+  --height 49 \
+  --block-hash 0000000000000000000000000000000000000000000000000000000000000031 \
+  --state-root 1111111111111111111111111111111111111111111111111111111111111111 \
+  --block-timestamp 2026-05-11T00:00:00Z \
+  --state-manifest-path v1/snapshots/full/h000000049-sr_11111111/manifest.json \
+  --state-manifest-sha256 ... \
+  --blob-coverage-path v1/blobs/coverage/h000000049-b_00000000.json \
+  --blob-coverage-sha256 ... \
+  --blob-coverage-from-height 0 \
+  --blob-coverage-to-height 49 \
+  --blob-coverage-to-block-hash 0000000000000000000000000000000000000000000000000000000000000031 \
+  --out ./target/archive-blob-poc
+
+cargo run -- verify-archive-complete \
+  --config ./examples/config.example.toml \
+  --source local_mainnet \
+  --archive-manifest v1/archive/checkpoints/h000000049-b_00000000/archive-manifest.json \
+  --target-height 49
+
+cargo run -- archive-restore-complete \
+  --config ./examples/config.example.toml \
+  --source local_mainnet \
+  --archive-manifest v1/archive/checkpoints/h000000049-b_00000000/archive-manifest.json \
+  --target-height 49 \
+  --destination-profile ./target/restored-profile \
+  --archive-dir ./target/restored-profile/archive
+```
+
+For the local invariant tests, `blobs-pack-range` reads deterministic POC block
+descriptors from `CHAIN_DB_DIR/blob-blocks/h#########.json`; each descriptor
+contains a height, block hash, and paths to real local blob bytes. Empty blocks
+are represented explicitly. This proves the archive/blob object and manifest
+rules locally, but it is not yet a production Rusk archive-node integration.
+
+The branch also includes `scripts/local-archive-blob-poc.sh`, a proof harness
+for a running local Rusk archive node. It uses `rusk-wallet blob` to submit real
+blob transactions, queries local GraphQL for block hashes and transaction blob
+hashes, downloads sidecar bytes through `/on/blobs:<hash>/hash`, exports the
+POC descriptors, and then runs state snapshot, blob range/coverage, archive
+pack, archive completeness verification, and manifest-driven restore of the
+matching state/archive artifacts against a local file store. It is intended for
+local proof runs only; it does not start or manage production services.
+
+The invariant suite covers checkpoint drift, incomplete coverage, missing or
+corrupted blob objects, range gaps, broken previous-range hashes, tampered
+signatures, unsafe archive paths, archive artifact corruption, and GC
+reachability across state/archive/blob artifacts.
+
 ## Calendar Orchestration
 
 Calendar retention labels are generated from UTC wall-clock time, not from the

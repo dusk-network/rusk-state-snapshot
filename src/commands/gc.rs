@@ -1,6 +1,6 @@
 use crate::{
-    cli::GcArgs, config::Config, manifest::SignedManifest, object_store, pointer::SignedPointer,
-    retention::RetentionPolicy,
+    archive_blob, cli::GcArgs, config::Config, manifest::SignedManifest, object_store,
+    pointer::SignedPointer, retention::RetentionPolicy,
 };
 use anyhow::Result;
 use chrono::Utc;
@@ -74,10 +74,11 @@ pub async fn run(args: GcArgs) -> Result<()> {
             }
         }
     }
+    archive_blob::mark_archive_blob_reachable(store.as_ref(), &mut marked).await?;
 
     let now = std::time::SystemTime::now();
     let mut deletable = Vec::new();
-    for prefix in ["v1/snapshots", "v1/staging"] {
+    for prefix in ["v1/snapshots", "v1/staging", "v1/archive", "v1/blobs"] {
         for meta in store.list_prefix(prefix).await? {
             if marked.contains(&meta.path) {
                 continue;
