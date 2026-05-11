@@ -27,6 +27,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Plan(args) => plan::run(args).await,
         Command::Watch(args) => watch::run(args).await,
         Command::Capture(args) => capture::run(args).await,
+        Command::BlobsExportRange(args) => archive_blob::blobs_export_range(args).await,
         Command::BlobsPackRange(args) => archive_blob::blobs_pack_range(args).await,
         Command::BlobsPublishRange(args) => archive_blob::blobs_publish_range(args).await,
         Command::BlobsPublishCoverage(args) => archive_blob::blobs_publish_coverage(args).await,

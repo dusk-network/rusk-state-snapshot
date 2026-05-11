@@ -184,7 +184,7 @@ Watch deletes candidate directories after successful publication by default.
 Manual `capture` keeps the candidate unless `--delete-candidate-after-publish`
 is provided.
 
-## Scope
+## Provisioner Snapshots
 
 Version 0 packs full provisioner snapshots only. The archive includes:
 
@@ -256,7 +256,7 @@ It moves existing `state` and `chain.db` into a timestamped backup directory,
 then moves the verified replacement into place. It never deletes live node state
 before verification.
 
-## GC Safety
+## Retention and GC
 
 `gc` is snapshot-object eviction only. It first prunes daily/monthly/yearly
 pointer labels according to the retention policy, then loads remaining pointers,
@@ -265,14 +265,13 @@ objects older than the grace period, and deletes them only with `--delete`. It
 never touches local node state. It prunes stale pointers and unreferenced
 artifacts; it does not create daily, monthly, yearly, or latest labels.
 
-On the experimental `poc/archive-blob-retention` branch, `gc` also understands
-archive/state reachability. A retained archive manifest pins its archive
-artifact and the matching state snapshot manifest and artifact. This is
-branch-local POC behavior and does not make archive/blob capture part of the
-default provisioner snapshot path.
+Archive/blob support is opt-in and remains separate from the default
+provisioner snapshot path. When archive roots are present, `gc` also follows
+archive/state reachability: a rooted archive manifest pins its archive artifact
+and the matching state snapshot manifest and artifact.
 
-Archive manifests are not GC roots by filename alone. The POC retains archive
-checkpoints through explicit roots under `v1/archive/pointers/...` or
+Archive manifests are not GC roots by filename alone. Archive checkpoints are
+retained through explicit roots under `v1/archive/pointers/...` or
 `v1/archive/pins/...`; unrooted archive checkpoints are eligible for deletion
 after the configured grace period.
 
@@ -283,40 +282,138 @@ Operators must also avoid object-store lifecycle policies that expire
 administrative flow, such as `blob-audit` or `blob-prune`, with stronger
 safeguards than snapshot GC.
 
-## Experimental Archive/Blob POC
+Normal GC deletion prefixes are:
 
-This branch contains local-only proof plumbing for archive/blob retention. State
-snapshots remain the existing provisioner snapshots. Archive snapshots are
-separate checkpoint-aligned artifacts under `v1/archive/checkpoints/...`, and
-blob data is stored independently under `v1/blobs/objects/...` by content hash.
-Blob completeness is proven by signed contiguous range manifests plus a signed
-coverage manifest; archive completeness is true only when the archive artifact,
-matching state snapshot, and blob coverage all verify.
+```text
+v1/snapshots/
+v1/staging/
+v1/archive/
+```
 
-The POC commands are intentionally separate:
+`v1/blobs/**` is intentionally absent from that list.
+
+## Archive Snapshots
+
+Archive snapshots are separate checkpoint-aligned artifacts under
+`v1/archive/checkpoints/...`. They reference an existing state snapshot and blob
+coverage for the same checkpoint. A valid archive snapshot must match the
+referenced state snapshot on network, height, block hash, and state root.
+
+Archive checkpoints are rooted only by:
+
+```text
+v1/archive/pointers/latest.json
+v1/archive/pins/<name>.json
+```
+
+The archive layout is:
+
+```text
+v1/
+  archive/
+    checkpoints/
+      h.../
+        archive-manifest.json
+        archive.tar.zst
+    pointers/
+      latest.json
+    pins/
+      <name>.json
+```
+
+Archive completeness verification checks the archive artifact, the referenced
+state manifest and artifact, and the referenced blob coverage before restore.
+Restore is manifest-driven and verification-first.
+
+## Blob Depot
+
+Blob data is stored independently as content-addressed objects. Blob
+completeness is proven by signed contiguous range manifests plus a signed
+coverage manifest. Empty blocks are represented explicitly so coverage proves
+that every height in the range was inspected.
+
+The blob layout is:
+
+```text
+v1/
+  blobs/
+    objects/
+      ab/
+        cd/
+          <blob_hash>
+    ranges/
+      h000000000-h000000999/
+        blob-range.json
+    coverage/
+      h000000999-b_<hash>.json
+```
+
+`blobs-publish-range` writes blob objects before the range manifest.
+`blobs-publish-coverage` verifies every referenced remote range manifest and
+blob object before writing the coverage manifest. Coverage manifests are the
+final truth objects for contiguous blob ranges.
+
+## Operational Flows
+
+Provisioner snapshots:
+
+```text
+pack -> publish -> promote -> rebuild-index -> gc
+```
+
+Archive checkpoints:
+
+```text
+state snapshot at H
+blob ranges/coverage through H
+archive-pack at H
+archive-publish
+archive-promote
+verify-archive-complete
+```
+
+Blob depot:
+
+```text
+blobs-export-range
+blobs-pack-range
+blobs-publish-range
+blobs-write-coverage
+blobs-publish-coverage
+blobs-verify-coverage
+```
+
+The archive/blob commands are explicit:
 
 ```sh
+cargo run -- blobs-export-range \
+  --network localnet \
+  --rusk-url http://127.0.0.1:8080 \
+  --from-height 0 \
+  --to-height 49 \
+  --out ./target/archive-blob-validation/descriptors
+
 cargo run -- blobs-pack-range \
   --network localnet \
   --from-height 0 \
   --to-height 49 \
-  --chain-db-dir ./target/poc-chain.db \
-  --out ./target/archive-blob-poc
+  --chain-db-dir ./target/archive-blob-validation/descriptors \
+  --out ./target/archive-blob-validation
 
 cargo run -- blobs-write-coverage \
   --network localnet \
-  --out ./target/archive-blob-poc \
-  ./target/archive-blob-poc/v1/blobs/ranges/h000000000-h000000049/blob-range.json
+  --out ./target/archive-blob-validation \
+  ./target/archive-blob-validation/v1/blobs/ranges/h000000000-h000000049/blob-range.json
 
 cargo run -- blobs-publish-range \
   --config ./examples/config.example.toml \
   --target local_mainnet \
-  ./target/archive-blob-poc/v1/blobs/ranges/h000000000-h000000049/blob-range.json
+  ./target/archive-blob-validation/v1/blobs/ranges/h000000000-h000000049/blob-range.json
 
 cargo run -- blobs-publish-coverage \
   --config ./examples/config.example.toml \
   --target local_mainnet \
-  ./target/archive-blob-poc/v1/blobs/coverage/h000000049-b_00000000.json
+  ./target/archive-blob-validation/v1/blobs/coverage/h000000049-b_00000000.json
 
 cargo run -- blobs-verify-coverage \
   --config ./examples/config.example.toml \
@@ -339,12 +436,12 @@ cargo run -- archive-pack \
   --blob-coverage-from-height 0 \
   --blob-coverage-to-height 49 \
   --blob-coverage-to-block-hash 0000000000000000000000000000000000000000000000000000000000000031 \
-  --out ./target/archive-blob-poc
+  --out ./target/archive-blob-validation
 
 cargo run -- archive-publish \
   --config ./examples/config.example.toml \
   --target local_mainnet \
-  ./target/archive-blob-poc/v1/archive/checkpoints/h000000049-b_00000000/archive-manifest.json
+  ./target/archive-blob-validation/v1/archive/checkpoints/h000000049-b_00000000/archive-manifest.json
 
 cargo run -- archive-promote \
   --config ./examples/config.example.toml \
@@ -367,43 +464,43 @@ cargo run -- archive-restore-complete \
   --archive-dir ./target/restored-profile/archive
 ```
 
-For the local invariant tests, `blobs-pack-range` reads deterministic POC block
-descriptors from `CHAIN_DB_DIR/blob-blocks/h#########.json`; each descriptor
-contains a height, block hash, and paths to real local blob bytes. Empty blocks
-are represented explicitly. This proves the archive/blob object and manifest
-rules locally, but it is not yet a production Rusk archive-node integration.
+For official sources, configure signature requirements for archive/blob data:
 
-The branch also includes `scripts/local-archive-blob-poc.sh`, a proof harness
-for a running local Rusk archive node. It uses `rusk-wallet blob` to submit real
-blob transactions, queries local GraphQL for block hashes and transaction blob
-hashes, downloads sidecar bytes through `/on/blobs:<hash>/hash`, exports the
-POC descriptors, and then runs state snapshot, blob range/coverage, archive
+```toml
+[archive_blob]
+require_signed_blob_ranges = true
+require_signed_blob_coverage = true
+require_signed_archive = true
+require_signed_archive_pointers = true
+```
+
+Unsigned archive/blob data is suitable only for local validation stores.
+
+## Validation Harness
+
+`scripts/local-archive-blob-validation.sh` validates the archive/blob flow
+against a running local Rusk archive node. It uses `rusk-wallet blob` to submit
+real blob transactions, queries local GraphQL for block hashes and transaction
+blob hashes, downloads sidecar bytes through `/on/blobs:<hash>/hash`, exports
+range descriptors, and then runs state snapshot, blob range/coverage, archive
 pack/publish, archive completeness verification, and manifest-driven restore of
-the matching state/archive artifacts against a local file store. With
-`RESTORED_NODE_CHECK=1`, the harness also starts a restored archive node,
+the matching state/archive artifacts against a local file store.
+
+The release sign-off mode is:
+
+```sh
+RESTORED_NODE_CHECK=1 scripts/local-archive-blob-validation.sh
+```
+
+With `RESTORED_NODE_CHECK=1`, the harness also starts a restored archive node,
 asserts that the restored H1 block is present, compares restored H1 archive
 events byte-for-byte against the original archive node, and waits for the
-restored node to advance to H2. It is intended for local proof runs only; it
-does not start or manage production services unless that restored-node check is
-explicitly enabled.
+restored node to advance to H2.
 
 The invariant suite covers checkpoint drift, incomplete coverage, missing or
 corrupted blob objects, range gaps, broken previous-range hashes, tampered
-signatures, unsafe archive paths, archive artifact corruption, and GC
-reachability across state/archive/blob artifacts.
-
-`blobs-publish-coverage` verifies that every referenced remote range manifest
-and blob object exists and hashes correctly before writing the coverage manifest.
-That keeps coverage manifests as the final truth object for a contiguous blob
-range. `archive-promote` writes an explicit archive retention root such as
-`v1/archive/pointers/latest.json` or `v1/archive/pins/<name>.json`; GC follows
-only these roots when preserving archive checkpoints and their referenced
-state/blob artifacts.
-
-Blob coverage manifests are not GC roots because they do not need to be:
-`v1/blobs/**` is excluded from normal GC entirely. Verification still requires
-coverage manifests, range manifests, and every referenced blob object to exist
-and hash correctly.
+signatures, unsafe archive paths, archive artifact corruption, WORM blob
+retention, and GC reachability across state/archive artifacts.
 
 ## Calendar Orchestration
 

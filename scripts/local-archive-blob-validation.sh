@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Local archive/blob retention proof harness.
+# Local archive/blob retention validation harness.
 #
-# This script intentionally lives on the POC branch. It expects a local Rusk
+# It expects a local Rusk
 # archive node and wallet to be available, generates real blob transactions
 # through rusk-wallet, exports block/blob descriptors from the node HTTP API,
-# then runs the experimental archive/blob snapshot commands against those
-# real sidecar bytes.
+# then runs the archive/blob commands against those real sidecar bytes.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUSK_REPO="${RUSK_REPO:-/home/hein_/projects/rusk-private-rc-pr117-build}"
-WORKDIR="${WORKDIR:-$ROOT/target/archive-blob-localnet-poc}"
+WORKDIR="${WORKDIR:-$ROOT/target/archive-blob-localnet-validation}"
 RUSK_URL="${RUSK_URL:-http://127.0.0.1:8080}"
 NETWORK="${NETWORK:-localnet}"
 FROM_HEIGHT="${FROM_HEIGHT:-0}"
@@ -20,7 +19,7 @@ ARCHIVE_DIR="${ARCHIVE_DIR:-}"
 STATE_DIR="${STATE_DIR:-}"
 CHAIN_DB_DIR="${CHAIN_DB_DIR:-}"
 SIGNING_KEY="${SIGNING_KEY:-}"
-KEY_ID="${KEY_ID:-local-poc}"
+KEY_ID="${KEY_ID:-local-validation}"
 TRUST_PUBLIC_KEY="${TRUST_PUBLIC_KEY:-}"
 WALLET_DIR="${WALLET_DIR:-$WORKDIR/wallet}"
 RESTORED_NODE_CHECK="${RESTORED_NODE_CHECK:-0}"
@@ -94,7 +93,7 @@ import sys
 
 path = pathlib.Path(sys.argv[1])
 idx = int(sys.argv[2])
-pattern = (f"archive-blob-poc-{idx:02d}-".encode() * 8192)[:131072]
+pattern = (f"archive-blob-validation-{idx:02d}-".encode() * 8192)[:131072]
 path.write_bytes(pattern.ljust(131072, bytes([idx])))
 PY
   mkdir -p "$WALLET_DIR"
@@ -146,45 +145,6 @@ wait_for_tx() {
   return 1
 }
 
-export_descriptors() {
-  local from="$1"
-  local to="$2"
-  local out="$3"
-  mkdir -p "$out/blob-blocks" "$out/blobs"
-  for height in $(seq "$from" "$to"); do
-    local block_json block_hash hashes_json
-    block_json="$(block_query "$height")"
-    if jq -e '.errors' <<<"$block_json" >/dev/null; then
-      echo "$block_json" | jq . >&2
-      exit 1
-    fi
-    block_hash="$(jq -r '.data.block.header.hash' <<<"$block_json")"
-    if [[ "$block_hash" == "null" || -z "$block_hash" ]]; then
-      echo "missing block $height from local GraphQL" >&2
-      exit 1
-    fi
-    hashes_json="$(jq -c '[.data.block.transactions[]?.tx.blobHashes[]?] | unique' <<<"$block_json")"
-    local paths_json='[]'
-    while IFS= read -r hash; do
-      [[ -z "$hash" ]] && continue
-      local blob_path="blobs/$hash.sidecar"
-      curl -fsS \
-        -H 'accept: application/octet-stream' \
-        -X POST \
-        "$RUSK_URL/on/blobs:$hash/hash" \
-        -o "$out/$blob_path"
-      paths_json="$(jq -cn --argjson paths "$paths_json" --arg path "$blob_path" '$paths + [$path]')"
-    done < <(jq -r '.[]' <<<"$hashes_json")
-
-    jq -cn \
-      --argjson height "$height" \
-      --arg block_hash "$block_hash" \
-      --argjson blobs "$paths_json" \
-      '{height:$height, block_hash:$block_hash, blobs:$blobs}' \
-      > "$out/blob-blocks/$(printf 'h%09d.json' "$height")"
-  done
-}
-
 write_config() {
   local store="$1"
   if [[ -n "$TRUST_PUBLIC_KEY" ]]; then
@@ -193,25 +153,31 @@ write_config() {
 scheme = "ed25519"
 public_key = "$TRUST_PUBLIC_KEY"
 
-[source.local_poc]
+[source.local_validation]
 kind = "file"
 path = "$store"
 trusted_keys = ["$KEY_ID"]
 
-[target.local_poc]
+[target.local_validation]
 kind = "file"
 path = "$store"
 trusted_keys = ["$KEY_ID"]
 signing_key = "$SIGNING_KEY"
 signing_key_id = "$KEY_ID"
+
+[archive_blob]
+require_signed_blob_ranges = true
+require_signed_blob_coverage = true
+require_signed_archive = true
+require_signed_archive_pointers = true
 EOF
   else
     cat > "$WORKDIR/config.toml" <<EOF
-[source.local_poc]
+[source.local_validation]
 kind = "file"
 path = "$store"
 
-[target.local_poc]
+[target.local_validation]
 kind = "file"
 path = "$store"
 EOF
@@ -242,13 +208,13 @@ pack_state_snapshot() {
     --block-hash "$block_hash" \
     --state-root "$state_hash" \
     --block-timestamp "$block_ts" \
-    --rusk-version "local-poc" \
+    --rusk-version "local-validation" \
     --out "$LOCAL" \
-    --publisher-name "local-poc" \
+    --publisher-name "local-validation" \
     $(sign_args))"
   manifest_rel="$(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- publish \
     --config "$WORKDIR/config.toml" \
-    --target local_poc \
+    --target local_validation \
     "$pack_dir/manifest.json")"
   sha256sum "$pack_dir/manifest.json" | awk '{print $1}' > "$WORKDIR/state-manifest.sha"
   printf '%s\n' "$manifest_rel"
@@ -350,7 +316,12 @@ echo "first blob tx included at height $H1; checkpointing archive/state at H1"
 wait_tip "$H1"
 
 echo "exporting block/blob descriptors for $FROM_HEIGHT..$H1"
-export_descriptors "$FROM_HEIGHT" "$H1" "$DESCRIPTORS"
+cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs-export-range \
+  --network "$NETWORK" \
+  --rusk-url "$RUSK_URL" \
+  --from-height "$FROM_HEIGHT" \
+  --to-height "$H1" \
+  --out "$DESCRIPTORS" >/dev/null
 
 echo "packing H1 state snapshot"
 H1_STATE_HASH="$(block_field "$H1" stateHash)"
@@ -370,7 +341,7 @@ RANGE1_MANIFEST="$(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs
 RANGE1_SHA="$(sha256sum "$RANGE1_MANIFEST" | awk '{print $1}')"
 cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs-publish-range \
   --config "$WORKDIR/config.toml" \
-  --target local_poc \
+  --target local_validation \
   "$RANGE1_MANIFEST" >/dev/null
 COVERAGE_H1_MANIFEST="$(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs-write-coverage \
   --network "$NETWORK" \
@@ -381,7 +352,7 @@ COVERAGE_H1_REL="${COVERAGE_H1_MANIFEST#"$LOCAL/"}"
 COVERAGE_H1_SHA="$(sha256sum "$COVERAGE_H1_MANIFEST" | awk '{print $1}')"
 cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs-publish-coverage \
   --config "$WORKDIR/config.toml" \
-  --target local_poc \
+  --target local_validation \
   "$COVERAGE_H1_MANIFEST" >/dev/null
 
 echo "packing H1 archive checkpoint"
@@ -406,12 +377,12 @@ ARCHIVE_MANIFEST="$(find "$LOCAL/v1/archive/checkpoints" -name archive-manifest.
 ARCHIVE_REL="${ARCHIVE_MANIFEST#"$LOCAL/"}"
 cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- archive-publish \
   --config "$WORKDIR/config.toml" \
-  --target local_poc \
+  --target local_validation \
   "$ARCHIVE_MANIFEST" >/dev/null
 if [[ -n "$SIGNING_KEY" ]]; then
   cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- archive-promote \
     --config "$WORKDIR/config.toml" \
-    --target local_poc \
+    --target local_validation \
     --archive-manifest "$ARCHIVE_REL" \
     --label latest >/dev/null
 fi
@@ -430,7 +401,12 @@ wait_tip "$H2"
 
 NEXT_FROM="$((H1 + 1))"
 echo "exporting block/blob descriptors for $NEXT_FROM..$H2"
-export_descriptors "$NEXT_FROM" "$H2" "$DESCRIPTORS"
+cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs-export-range \
+  --network "$NETWORK" \
+  --rusk-url "$RUSK_URL" \
+  --from-height "$NEXT_FROM" \
+  --to-height "$H2" \
+  --out "$DESCRIPTORS" >/dev/null
 
 echo "packing H1+1..H2 blob range and full coverage"
 RANGE2_MANIFEST="$(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs-pack-range \
@@ -443,7 +419,7 @@ RANGE2_MANIFEST="$(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs
   $(sign_args))"
 cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs-publish-range \
   --config "$WORKDIR/config.toml" \
-  --target local_poc \
+  --target local_validation \
   "$RANGE2_MANIFEST" >/dev/null
 COVERAGE_H2_MANIFEST="$(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs-write-coverage \
   --network "$NETWORK" \
@@ -453,18 +429,18 @@ COVERAGE_H2_MANIFEST="$(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- 
 COVERAGE_H2_REL="${COVERAGE_H2_MANIFEST#"$LOCAL/"}"
 cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs-publish-coverage \
   --config "$WORKDIR/config.toml" \
-  --target local_poc \
+  --target local_validation \
   "$COVERAGE_H2_MANIFEST" >/dev/null
 
 echo "verifying completeness from published manifests"
 cargo run --manifest-path "$ROOT/Cargo.toml" -- verify-archive-complete \
   --config "$WORKDIR/config.toml" \
-  --source local_poc \
+  --source local_validation \
   --archive-manifest "$ARCHIVE_REL" \
   --target-height "$H1"
 cargo run --manifest-path "$ROOT/Cargo.toml" -- blobs-verify-coverage \
   --config "$WORKDIR/config.toml" \
-  --source local_poc \
+  --source local_validation \
   --coverage-manifest "$COVERAGE_H2_REL" \
   --from-height "$FROM_HEIGHT" \
   --to-height "$H2"
@@ -475,7 +451,7 @@ RESTORE_ARCHIVE="$RESTORE_PROFILE/archive"
 rm -rf "$RESTORE_PROFILE" "$RESTORE_ARCHIVE"
 cargo run --manifest-path "$ROOT/Cargo.toml" -- archive-restore-complete \
   --config "$WORKDIR/config.toml" \
-  --source local_poc \
+  --source local_validation \
   --archive-manifest "$ARCHIVE_REL" \
   --target-height "$H1" \
   --destination-profile "$RESTORE_PROFILE" \
@@ -499,4 +475,4 @@ jq -n \
     h2_coverage_manifest: $h2_coverage
   }' > "$WORKDIR/proof-summary.json"
 
-echo "local archive/blob snapshot POC completed"
+echo "local archive/blob snapshot validation completed"

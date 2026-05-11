@@ -22,25 +22,27 @@ pub enum Command {
     Plan(PlanArgs),
     Watch(WatchArgs),
     Capture(CaptureArgs),
-    /// Experimental archive/blob POC: pack a signed blob range from local block descriptors.
+    /// Export block/blob descriptors from a Rusk GraphQL node.
+    BlobsExportRange(BlobsExportRangeArgs),
+    /// Pack a signed blob range from exported block/blob descriptors.
     BlobsPackRange(BlobsPackRangeArgs),
-    /// Experimental archive/blob POC: publish a packed blob range and its objects.
+    /// Publish a packed blob range and its content-addressed objects.
     BlobsPublishRange(BlobsPublishRangeArgs),
-    /// Experimental archive/blob POC: publish a coverage manifest after dependencies exist.
+    /// Publish a coverage manifest after referenced ranges and objects exist.
     BlobsPublishCoverage(BlobsPublishCoverageArgs),
-    /// Experimental archive/blob POC: write a coverage manifest from packed range manifests.
+    /// Write a blob coverage manifest from packed range manifests.
     BlobsWriteCoverage(BlobsWriteCoverageArgs),
-    /// Experimental archive/blob POC: verify signed contiguous blob coverage.
+    /// Verify signed contiguous blob coverage.
     BlobsVerifyCoverage(BlobsVerifyCoverageArgs),
-    /// Experimental archive/blob POC: pack an archive checkpoint artifact and manifest.
+    /// Pack an archive checkpoint artifact and manifest.
     ArchivePack(ArchivePackArgs),
-    /// Experimental archive/blob POC: publish an archive artifact and manifest.
+    /// Publish an archive artifact and manifest.
     ArchivePublish(ArchivePublishArgs),
-    /// Experimental archive/blob POC: promote an archive checkpoint as an explicit GC root.
+    /// Promote an archive checkpoint as an explicit GC root.
     ArchivePromote(ArchivePromoteArgs),
-    /// Experimental archive/blob POC: verify archive/state/blob checkpoint completeness.
+    /// Verify archive/state/blob checkpoint completeness.
     VerifyArchiveComplete(VerifyArchiveCompleteArgs),
-    /// Experimental archive/blob POC: restore matching state and archive artifacts.
+    /// Restore matching state and archive artifacts after verification.
     ArchiveRestoreComplete(ArchiveRestoreCompleteArgs),
 }
 
@@ -304,6 +306,20 @@ pub struct CaptureArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct BlobsExportRangeArgs {
+    #[arg(long)]
+    pub network: String,
+    #[arg(long)]
+    pub rusk_url: String,
+    #[arg(long)]
+    pub from_height: u64,
+    #[arg(long)]
+    pub to_height: u64,
+    #[arg(long)]
+    pub out: PathBuf,
+}
+
+#[derive(Debug, Args)]
 pub struct BlobsPackRangeArgs {
     #[arg(long)]
     pub network: String,
@@ -311,7 +327,7 @@ pub struct BlobsPackRangeArgs {
     pub from_height: u64,
     #[arg(long)]
     pub to_height: u64,
-    /// POC input directory. Expects blob-blocks/h#########.json descriptors.
+    /// Descriptor directory produced by blobs-export-range. Expects blob-blocks/h#########.json.
     #[arg(long)]
     pub chain_db_dir: PathBuf,
     #[arg(long)]
@@ -453,7 +469,7 @@ pub struct ArchiveRestoreCompleteArgs {
     pub destination_profile: PathBuf,
     #[arg(long)]
     pub archive_dir: PathBuf,
-    /// Replace existing restored state/archive directories. Intended for POC restore tests only.
+    /// Replace existing restored state/archive directories.
     #[arg(long)]
     pub replace: bool,
 }
