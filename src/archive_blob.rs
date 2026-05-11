@@ -678,6 +678,44 @@ pub async fn publish_blob_coverage(
     Ok(remote)
 }
 
+pub async fn publish_archive(
+    store: &dyn ObjectStore,
+    local_archive_manifest: &Path,
+) -> Result<String> {
+    let root = local_artifact_root(local_archive_manifest)?;
+    let bytes = fs::read(local_archive_manifest)
+        .with_context(|| format!("read {}", local_archive_manifest.display()))?;
+    let archive: SignedArchiveManifest = serde_json::from_slice(&bytes)?;
+    archive.validate_schema()?;
+    let remote = archive_manifest_path(archive.body.height, &archive.body.block_hash);
+    let local_remote = local_archive_manifest
+        .strip_prefix(&root)
+        .with_context(|| {
+            format!(
+                "{} is not under {}",
+                local_archive_manifest.display(),
+                root.display()
+            )
+        })?
+        .to_string_lossy()
+        .replace('\\', "/");
+    if local_remote != remote {
+        bail!("archive manifest path does not match checkpoint path");
+    }
+    let archive_dir = remote
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .context("archive manifest path has no parent")?;
+    for artifact in &archive.body.artifacts {
+        let remote_artifact = format!("{archive_dir}/{}", artifact.path);
+        let local_artifact = root.join(&remote_artifact);
+        verify_local_archive_artifact(&local_artifact, artifact)?;
+        put_immutable_or_same(store, &remote_artifact, &fs::read(&local_artifact)?).await?;
+    }
+    put_immutable_or_same(store, &remote, &bytes).await?;
+    Ok(remote)
+}
+
 pub async fn promote_archive_manifest(
     store: &dyn ObjectStore,
     manifest_path: &str,
@@ -700,16 +738,7 @@ pub async fn promote_archive_manifest(
         .context("archive manifest path has no parent")?;
     for artifact in &archive.body.artifacts {
         let artifact_path = format!("{archive_dir}/{}", artifact.path);
-        let meta = store.stat(&artifact_path).await?.ok_or_else(|| {
-            anyhow::anyhow!("archive artifact missing on target: {artifact_path}")
-        })?;
-        if meta.size != artifact.size {
-            bail!(
-                "archive artifact size mismatch for {artifact_path}: manifest says {}, store reports {}",
-                artifact.size,
-                meta.size
-            );
-        }
+        verify_remote_file_hashes(store, &artifact_path, artifact).await?;
     }
 
     let body = ArchivePointerBody {
@@ -1277,7 +1306,7 @@ async fn verify_remote_file_hashes(
         },
         artifact.size,
         &artifact.sha256,
-        &format!("blake3:{b3}"),
+        &format!("blake3:{}", artifact.blake3),
     )
 }
 
@@ -1540,6 +1569,7 @@ mod tests {
 
     struct Fixture {
         tmp: tempfile::TempDir,
+        local_root: PathBuf,
         store: FileStore,
         store_root: PathBuf,
         coverage_path: String,
@@ -1784,6 +1814,36 @@ mod tests {
         let remote = publish_blob_coverage(&store, &coverage).await.unwrap();
         assert!(remote.starts_with("v1/blobs/coverage/"));
         assert!(store.exists(&remote).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn archive_publish_uploads_artifact_before_manifest_and_promote_hashes_artifact() {
+        let fx = build_fixture().await;
+        let publish_root = fx.tmp.path().join("archive-publish-store");
+        let store = FileStore::new(&publish_root);
+        let remote = publish_archive(&store, &fx.local_root.join(&fx.archive_manifest_path))
+            .await
+            .unwrap();
+        assert_eq!(remote, fx.archive_manifest_path);
+        let artifact_path = remote
+            .rsplit_once('/')
+            .map(|(dir, _)| format!("{dir}/archive.tar.zst"))
+            .unwrap();
+        assert!(store.exists(&remote).await.unwrap());
+        assert!(store.exists(&artifact_path).await.unwrap());
+
+        let artifact = store.get(&artifact_path).await.unwrap();
+        store
+            .put(&artifact_path, &vec![0u8; artifact.len()])
+            .await
+            .unwrap();
+        assert!(
+            promote_archive_manifest(&store, &remote, "latest", SEED1, "k1", &fx.trust)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("mismatch")
+        );
     }
 
     #[tokio::test]
@@ -2129,6 +2189,7 @@ mod tests {
         );
         Fixture {
             tmp,
+            local_root,
             store,
             store_root,
             coverage_path,

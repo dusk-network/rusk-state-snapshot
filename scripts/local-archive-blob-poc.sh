@@ -23,6 +23,21 @@ SIGNING_KEY="${SIGNING_KEY:-}"
 KEY_ID="${KEY_ID:-local-poc}"
 TRUST_PUBLIC_KEY="${TRUST_PUBLIC_KEY:-}"
 WALLET_DIR="${WALLET_DIR:-$WORKDIR/wallet}"
+RESTORED_NODE_CHECK="${RESTORED_NODE_CHECK:-0}"
+RUSK_BIN="${RUSK_BIN:-$RUSK_REPO/target/release/rusk}"
+RESTORE_HTTP_ADDR="${RESTORE_HTTP_ADDR:-127.0.0.1:8091}"
+RESTORE_URL="${RESTORE_URL:-http://$RESTORE_HTTP_ADDR}"
+RESTORE_KADCAST_ADDR="${RESTORE_KADCAST_ADDR:-127.0.0.1:9111}"
+RESTORE_NETWORK_ID="${RESTORE_NETWORK_ID:-239}"
+RESTORED_NODE_PID=""
+
+cleanup() {
+  if [[ -n "$RESTORED_NODE_PID" ]]; then
+    kill "$RESTORED_NODE_PID" >/dev/null 2>&1 || true
+    wait "$RESTORED_NODE_PID" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -32,11 +47,16 @@ need() {
 }
 
 graphql() {
-  local query="$1"
+  graphql_at "$RUSK_URL" "$1"
+}
+
+graphql_at() {
+  local url="$1"
+  local query="$2"
   curl -fsS \
     -H 'content-type: application/json' \
     -d "$(jq -cn --arg query "$query" '{query:$query}')" \
-    "$RUSK_URL/graphql"
+    "$url/graphql"
 }
 
 tip_height() {
@@ -240,6 +260,55 @@ block_field() {
   block_query "$height" | jq -r ".data.block.header.$field"
 }
 
+wait_remote_tip() {
+  local url="$1"
+  local target="$2"
+  local current
+  for _ in $(seq 1 120); do
+    current="$(graphql_at "$url" '{ block(height: -1) { header { height } } }' 2>/dev/null \
+      | jq -r '.data.block.header.height // empty' || true)"
+    if [[ "$current" =~ ^[0-9]+$ ]] && (( current >= target )); then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "timed out waiting for restored node tip >= $target" >&2
+  return 1
+}
+
+check_restored_node() {
+  if [[ "$RESTORED_NODE_CHECK" != "1" ]]; then
+    return 0
+  fi
+  if [[ ! -x "$RUSK_BIN" ]]; then
+    echo "RESTORED_NODE_CHECK=1 requires executable RUSK_BIN=$RUSK_BIN" >&2
+    exit 2
+  fi
+
+  echo "starting restored archive node and checking restored archive events"
+  RUSK_PROFILE_PATH="$RESTORE_PROFILE" \
+  RUSK_STATE_PATH="$RESTORE_PROFILE/state" \
+  DUSK_CONSENSUS_KEYS_PASS="${DUSK_CONSENSUS_KEYS_PASS:-password}" \
+    "$RUSK_BIN" \
+      --log-type plain \
+      --log-level info \
+      --db-path "$RESTORE_PROFILE" \
+      --http-listen-addr "$RESTORE_HTTP_ADDR" \
+      --kadcast-public-address "$RESTORE_KADCAST_ADDR" \
+      --network-id "$RESTORE_NETWORK_ID" \
+      > "$WORKDIR/restored-node.log" 2>&1 &
+  RESTORED_NODE_PID="$!"
+
+  wait_remote_tip "$RESTORE_URL" "$H1"
+  graphql_at "$RESTORE_URL" "{ checkBlock(height: $H1, hash: \"$H1_BLOCK_HASH\", onlyFinalized: false) }" \
+    | jq -e '.data.checkBlock == true' >/dev/null
+  graphql_at "$RESTORE_URL" "{ contractEvents(height: $H1) { json } }" \
+    | jq -S . > "$WORKDIR/restored-h1-events.json"
+  diff -u "$ORIGINAL_H1_EVENTS" "$WORKDIR/restored-h1-events.json"
+
+  wait_remote_tip "$RESTORE_URL" "$H2"
+}
+
 need cargo
 need curl
 need jq
@@ -335,8 +404,10 @@ cargo run --manifest-path "$ROOT/Cargo.toml" -- archive-pack \
 
 ARCHIVE_MANIFEST="$(find "$LOCAL/v1/archive/checkpoints" -name archive-manifest.json | sort | tail -1)"
 ARCHIVE_REL="${ARCHIVE_MANIFEST#"$LOCAL/"}"
-mkdir -p "$STORE/v1/archive"
-cp -a "$LOCAL/v1/archive/." "$STORE/v1/archive/"
+cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- archive-publish \
+  --config "$WORKDIR/config.toml" \
+  --target local_poc \
+  "$ARCHIVE_MANIFEST" >/dev/null
 if [[ -n "$SIGNING_KEY" ]]; then
   cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- archive-promote \
     --config "$WORKDIR/config.toml" \
@@ -409,6 +480,8 @@ cargo run --manifest-path "$ROOT/Cargo.toml" -- archive-restore-complete \
   --target-height "$H1" \
   --destination-profile "$RESTORE_PROFILE" \
   --archive-dir "$RESTORE_ARCHIVE"
+
+check_restored_node
 
 jq -n \
   --arg tx1 "$TX1" \

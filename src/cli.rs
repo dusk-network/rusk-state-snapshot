@@ -34,6 +34,8 @@ pub enum Command {
     BlobsVerifyCoverage(BlobsVerifyCoverageArgs),
     /// Experimental archive/blob POC: pack an archive checkpoint artifact and manifest.
     ArchivePack(ArchivePackArgs),
+    /// Experimental archive/blob POC: publish an archive artifact and manifest.
+    ArchivePublish(ArchivePublishArgs),
     /// Experimental archive/blob POC: promote an archive checkpoint as an explicit GC root.
     ArchivePromote(ArchivePromoteArgs),
     /// Experimental archive/blob POC: verify archive/state/blob checkpoint completeness.
@@ -401,6 +403,15 @@ pub struct ArchivePackArgs {
     pub signing_key: Option<String>,
     #[arg(long)]
     pub key_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ArchivePublishArgs {
+    #[arg(long)]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub target: String,
+    pub manifest: PathBuf,
 }
 
 #[derive(Debug, Args)]

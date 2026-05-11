@@ -335,6 +335,11 @@ cargo run -- archive-pack \
   --blob-coverage-to-block-hash 0000000000000000000000000000000000000000000000000000000000000031 \
   --out ./target/archive-blob-poc
 
+cargo run -- archive-publish \
+  --config ./examples/config.example.toml \
+  --target local_mainnet \
+  ./target/archive-blob-poc/v1/archive/checkpoints/h000000049-b_00000000/archive-manifest.json
+
 cargo run -- archive-promote \
   --config ./examples/config.example.toml \
   --target local_mainnet \
@@ -367,9 +372,14 @@ for a running local Rusk archive node. It uses `rusk-wallet blob` to submit real
 blob transactions, queries local GraphQL for block hashes and transaction blob
 hashes, downloads sidecar bytes through `/on/blobs:<hash>/hash`, exports the
 POC descriptors, and then runs state snapshot, blob range/coverage, archive
-pack, archive completeness verification, and manifest-driven restore of the
-matching state/archive artifacts against a local file store. It is intended for
-local proof runs only; it does not start or manage production services.
+pack/publish, archive completeness verification, and manifest-driven restore of
+the matching state/archive artifacts against a local file store. With
+`RESTORED_NODE_CHECK=1`, the harness also starts a restored archive node,
+asserts that the restored H1 block is present, compares restored H1 archive
+events byte-for-byte against the original archive node, and waits for the
+restored node to advance to H2. It is intended for local proof runs only; it
+does not start or manage production services unless that restored-node check is
+explicitly enabled.
 
 The invariant suite covers checkpoint drift, incomplete coverage, missing or
 corrupted blob objects, range gaps, broken previous-range hashes, tampered
@@ -383,6 +393,11 @@ range. `archive-promote` writes an explicit archive retention root such as
 `v1/archive/pointers/latest.json` or `v1/archive/pins/<name>.json`; GC follows
 only these roots when preserving archive checkpoints and their referenced
 state/blob artifacts.
+
+Blob coverage manifests are not GC roots by filename alone. They are retained
+when reachable from an archive manifest rooted by an archive pointer/pin; an
+unreferenced coverage manifest and its objects can be collected after the grace
+period.
 
 ## Calendar Orchestration
 

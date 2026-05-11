@@ -33,6 +33,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::BlobsWriteCoverage(args) => archive_blob::blobs_write_coverage(args).await,
         Command::BlobsVerifyCoverage(args) => archive_blob::blobs_verify_coverage(args).await,
         Command::ArchivePack(args) => archive_blob::archive_pack(args).await,
+        Command::ArchivePublish(args) => archive_blob::archive_publish(args).await,
         Command::ArchivePromote(args) => archive_blob::archive_promote(args).await,
         Command::VerifyArchiveComplete(args) => archive_blob::verify_archive_complete(args).await,
         Command::ArchiveRestoreComplete(args) => archive_blob::archive_restore_complete(args).await,

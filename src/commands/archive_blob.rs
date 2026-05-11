@@ -2,9 +2,9 @@ use crate::{
     archive_blob,
     archive_blob::{ArchivePackOptions, PackBlobRangeOptions},
     cli::{
-        ArchivePackArgs, ArchivePromoteArgs, ArchiveRestoreCompleteArgs, BlobsPackRangeArgs,
-        BlobsPublishCoverageArgs, BlobsPublishRangeArgs, BlobsVerifyCoverageArgs,
-        BlobsWriteCoverageArgs, VerifyArchiveCompleteArgs,
+        ArchivePackArgs, ArchivePromoteArgs, ArchivePublishArgs, ArchiveRestoreCompleteArgs,
+        BlobsPackRangeArgs, BlobsPublishCoverageArgs, BlobsPublishRangeArgs,
+        BlobsVerifyCoverageArgs, BlobsWriteCoverageArgs, VerifyArchiveCompleteArgs,
     },
     config::Config,
     object_store,
@@ -93,6 +93,15 @@ pub async fn archive_pack(args: ArchivePackArgs) -> Result<()> {
         key_id: args.key_id,
     })?;
     println!("{}", path.display());
+    Ok(())
+}
+
+pub async fn archive_publish(args: ArchivePublishArgs) -> Result<()> {
+    let cfg = Config::load(&args.config)?;
+    let target = cfg.target(&args.target)?;
+    let store = object_store::from_endpoint(target)?;
+    let remote = archive_blob::publish_archive(store.as_ref(), &args.manifest).await?;
+    println!("{remote}");
     Ok(())
 }
 
