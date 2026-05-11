@@ -2,8 +2,9 @@ use crate::{
     archive_blob,
     archive_blob::{ArchivePackOptions, PackBlobRangeOptions},
     cli::{
-        ArchivePackArgs, ArchiveRestoreCompleteArgs, BlobsPackRangeArgs, BlobsPublishRangeArgs,
-        BlobsVerifyCoverageArgs, BlobsWriteCoverageArgs, VerifyArchiveCompleteArgs,
+        ArchivePackArgs, ArchivePromoteArgs, ArchiveRestoreCompleteArgs, BlobsPackRangeArgs,
+        BlobsPublishCoverageArgs, BlobsPublishRangeArgs, BlobsVerifyCoverageArgs,
+        BlobsWriteCoverageArgs, VerifyArchiveCompleteArgs,
     },
     config::Config,
     object_store,
@@ -30,6 +31,15 @@ pub async fn blobs_publish_range(args: BlobsPublishRangeArgs) -> Result<()> {
     let target = cfg.target(&args.target)?;
     let store = object_store::from_endpoint(target)?;
     let remote = archive_blob::publish_blob_range(store.as_ref(), &args.manifest).await?;
+    println!("{remote}");
+    Ok(())
+}
+
+pub async fn blobs_publish_coverage(args: BlobsPublishCoverageArgs) -> Result<()> {
+    let cfg = Config::load(&args.config)?;
+    let target = cfg.target(&args.target)?;
+    let store = object_store::from_endpoint(target)?;
+    let remote = archive_blob::publish_blob_coverage(store.as_ref(), &args.manifest).await?;
     println!("{remote}");
     Ok(())
 }
@@ -83,6 +93,26 @@ pub async fn archive_pack(args: ArchivePackArgs) -> Result<()> {
         key_id: args.key_id,
     })?;
     println!("{}", path.display());
+    Ok(())
+}
+
+pub async fn archive_promote(args: ArchivePromoteArgs) -> Result<()> {
+    let cfg = Config::load(&args.config)?;
+    let target = cfg.target(&args.target)?;
+    let key_spec = target.signing_key()?;
+    let key_id = target.signing_key_id()?;
+    let trust = cfg.trusted_for_endpoint(target)?;
+    let store = object_store::from_endpoint(target)?;
+    let path = archive_blob::promote_archive_manifest(
+        store.as_ref(),
+        &args.archive_manifest,
+        &args.label,
+        key_spec,
+        key_id,
+        &trust,
+    )
+    .await?;
+    println!("{path}");
     Ok(())
 }
 

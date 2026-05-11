@@ -272,6 +272,11 @@ the signed blob range manifests, and every referenced content-addressed blob
 object. This is branch-local POC behavior and does not make archive/blob capture
 part of the default provisioner snapshot path.
 
+Archive manifests are not GC roots by filename alone. The POC retains archive
+checkpoints through explicit roots under `v1/archive/pointers/...` or
+`v1/archive/pins/...`; unrooted archive checkpoints are eligible for deletion
+after the configured grace period.
+
 ## Experimental Archive/Blob POC
 
 This branch contains local-only proof plumbing for archive/blob retention. State
@@ -302,6 +307,11 @@ cargo run -- blobs-publish-range \
   --target local_mainnet \
   ./target/archive-blob-poc/v1/blobs/ranges/h000000000-h000000049/blob-range.json
 
+cargo run -- blobs-publish-coverage \
+  --config ./examples/config.example.toml \
+  --target local_mainnet \
+  ./target/archive-blob-poc/v1/blobs/coverage/h000000049-b_00000000.json
+
 cargo run -- blobs-verify-coverage \
   --config ./examples/config.example.toml \
   --source local_mainnet \
@@ -324,6 +334,12 @@ cargo run -- archive-pack \
   --blob-coverage-to-height 49 \
   --blob-coverage-to-block-hash 0000000000000000000000000000000000000000000000000000000000000031 \
   --out ./target/archive-blob-poc
+
+cargo run -- archive-promote \
+  --config ./examples/config.example.toml \
+  --target local_mainnet \
+  --archive-manifest v1/archive/checkpoints/h000000049-b_00000000/archive-manifest.json \
+  --label latest
 
 cargo run -- verify-archive-complete \
   --config ./examples/config.example.toml \
@@ -359,6 +375,14 @@ The invariant suite covers checkpoint drift, incomplete coverage, missing or
 corrupted blob objects, range gaps, broken previous-range hashes, tampered
 signatures, unsafe archive paths, archive artifact corruption, and GC
 reachability across state/archive/blob artifacts.
+
+`blobs-publish-coverage` verifies that every referenced remote range manifest
+and blob object exists and hashes correctly before writing the coverage manifest.
+That keeps coverage manifests as the final truth object for a contiguous blob
+range. `archive-promote` writes an explicit archive retention root such as
+`v1/archive/pointers/latest.json` or `v1/archive/pins/<name>.json`; GC follows
+only these roots when preserving archive checkpoints and their referenced
+state/blob artifacts.
 
 ## Calendar Orchestration
 

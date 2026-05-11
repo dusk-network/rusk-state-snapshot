@@ -20,6 +20,7 @@ use walkdir::WalkDir;
 pub const BLOB_RANGE_FORMAT: &str = "rusk-blob-range/v1";
 pub const BLOB_COVERAGE_FORMAT: &str = "rusk-blob-coverage/v1";
 pub const ARCHIVE_MANIFEST_FORMAT: &str = "rusk-archive-snapshot/v1";
+pub const ARCHIVE_POINTER_FORMAT: &str = "rusk-archive-pointer/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlobObjectRef {
@@ -138,6 +139,27 @@ pub struct SignedArchiveManifest {
     pub signature: Option<SignatureBlock>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchivePointerBody {
+    pub format: String,
+    pub network: String,
+    pub label: String,
+    pub manifest_path: String,
+    pub manifest_sha256: String,
+    pub height: u64,
+    pub block_hash: String,
+    pub state_root: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignedArchivePointer {
+    #[serde(flatten)]
+    pub body: ArchivePointerBody,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<SignatureBlock>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainBlockDescriptor {
     pub height: u64,
@@ -186,6 +208,12 @@ pub struct ArchiveCompleteness {
     pub state_manifest_path: String,
     pub blob_coverage_path: String,
     pub blob_objects: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageProof {
+    pub blob_objects: usize,
+    pub block_hashes: BTreeMap<u64, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -352,6 +380,26 @@ impl SignedArchiveManifest {
     }
 }
 
+impl SignedArchivePointer {
+    pub fn validate_schema(&self) -> Result<()> {
+        let body = &self.body;
+        if body.format != ARCHIVE_POINTER_FORMAT {
+            bail!("unsupported archive pointer format {}", body.format);
+        }
+        validate_object_path(&body.manifest_path)?;
+        if !body.manifest_path.starts_with("v1/archive/checkpoints/")
+            || !body.manifest_path.ends_with("/archive-manifest.json")
+        {
+            bail!("archive pointer manifest path must reference immutable archive checkpoint manifest");
+        }
+        require_hex("archive pointer manifest sha256", &body.manifest_sha256, 32)?;
+        require_hex("archive pointer block_hash", &body.block_hash, 32)?;
+        require_hex("archive pointer state_root", &body.state_root, 32)?;
+        archive_pointer_path(&body.label)?;
+        Ok(())
+    }
+}
+
 pub fn blob_object_path(blake3_hex: &str) -> Result<String> {
     require_hex("blob blake3", blake3_hex, 32)?;
     Ok(format!(
@@ -374,6 +422,17 @@ pub fn blob_coverage_path(to_height: u64, to_block_hash: &str) -> String {
 pub fn archive_manifest_path(height: u64, block_hash: &str) -> String {
     let prefix = &block_hash[..block_hash.len().min(8)];
     format!("v1/archive/checkpoints/h{height:09}-b_{prefix}/archive-manifest.json")
+}
+
+pub fn archive_pointer_path(label: &str) -> Result<String> {
+    if label == "latest" {
+        Ok("v1/archive/pointers/latest.json".to_string())
+    } else if let Some(pin) = label.strip_prefix("pin:") {
+        validate_path_component(pin)?;
+        Ok(format!("v1/archive/pins/{pin}.json"))
+    } else {
+        bail!("unsupported archive pointer label {label}; use latest or pin:<name>");
+    }
 }
 
 pub fn pack_blob_range(opts: PackBlobRangeOptions) -> Result<PathBuf> {
@@ -605,6 +664,75 @@ pub async fn publish_blob_range(
     Ok(remote)
 }
 
+pub async fn publish_blob_coverage(
+    store: &dyn ObjectStore,
+    local_coverage_manifest: &Path,
+) -> Result<String> {
+    let bytes = fs::read(local_coverage_manifest)
+        .with_context(|| format!("read {}", local_coverage_manifest.display()))?;
+    let coverage: SignedBlobCoverage = serde_json::from_slice(&bytes)?;
+    coverage.validate_schema()?;
+    verify_coverage_ranges_without_signatures(store, &coverage).await?;
+    let remote = blob_coverage_path(coverage.body.to_height, &coverage.body.to_block_hash);
+    put_immutable_or_same(store, &remote, &bytes).await?;
+    Ok(remote)
+}
+
+pub async fn promote_archive_manifest(
+    store: &dyn ObjectStore,
+    manifest_path: &str,
+    label: &str,
+    signing_key: &str,
+    key_id: &str,
+    trust: &HashMap<String, TrustKey>,
+) -> Result<String> {
+    validate_object_path(manifest_path)?;
+    let bytes = store.get(manifest_path).await?;
+    let archive: SignedArchiveManifest = serde_json::from_slice(&bytes)?;
+    archive.validate_schema()?;
+    if archive.signature.is_some() || !trust.is_empty() {
+        archive.verify_signature(trust)?;
+    }
+    let manifest_sha256 = hashing::sha256_bytes(&bytes);
+    let archive_dir = manifest_path
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .context("archive manifest path has no parent")?;
+    for artifact in &archive.body.artifacts {
+        let artifact_path = format!("{archive_dir}/{}", artifact.path);
+        let meta = store.stat(&artifact_path).await?.ok_or_else(|| {
+            anyhow::anyhow!("archive artifact missing on target: {artifact_path}")
+        })?;
+        if meta.size != artifact.size {
+            bail!(
+                "archive artifact size mismatch for {artifact_path}: manifest says {}, store reports {}",
+                artifact.size,
+                meta.size
+            );
+        }
+    }
+
+    let body = ArchivePointerBody {
+        format: ARCHIVE_POINTER_FORMAT.to_string(),
+        network: archive.body.network,
+        label: label.to_string(),
+        manifest_path: manifest_path.to_string(),
+        manifest_sha256,
+        height: archive.body.height,
+        block_hash: archive.body.block_hash,
+        state_root: archive.body.state_root,
+        updated_at: Utc::now(),
+    };
+    let signature = sign_if_requested(&body, Some(signing_key), Some(key_id))?;
+    let pointer = SignedArchivePointer { body, signature };
+    pointer.validate_schema()?;
+    let path = archive_pointer_path(label)?;
+    store
+        .put(&path, &serde_json::to_vec_pretty(&pointer)?)
+        .await?;
+    Ok(path)
+}
+
 #[cfg(test)]
 pub async fn publish_local_object_tree(store: &dyn ObjectStore, root: &Path) -> Result<()> {
     let root = root.canonicalize()?;
@@ -650,7 +778,9 @@ pub async fn verify_blob_coverage(
             coverage.body.to_height
         );
     }
-    verify_coverage_ranges(store, &coverage, trust).await
+    Ok(verify_coverage_ranges(store, &coverage, trust)
+        .await?
+        .blob_objects)
 }
 
 pub async fn verify_archive_complete(
@@ -718,19 +848,17 @@ pub async fn verify_archive_complete(
     if coverage.body.to_height < target_height || target_height < archive.body.height {
         bail!("blob coverage does not reach requested target height");
     }
-    if coverage.body.to_height == archive.body.height
-        && coverage.body.to_block_hash != archive.body.block_hash
-    {
-        bail!("coverage ending at archive height has wrong block hash");
+    let proof = verify_coverage_ranges(store, &coverage, trust).await?;
+    if proof.block_hashes.get(&archive.body.height) != Some(&archive.body.block_hash) {
+        bail!("blob coverage block hash at archive height does not match archive checkpoint");
     }
-    let blob_objects = verify_coverage_ranges(store, &coverage, trust).await?;
     Ok(ArchiveCompleteness {
         archive_manifest_path: archive_manifest_path.to_string(),
         archive_height: archive.body.height,
         target_height,
         state_manifest_path: archive.body.state_snapshot.manifest_path,
         blob_coverage_path: archive.body.blob_coverage.coverage_manifest_path,
-        blob_objects,
+        blob_objects: proof.blob_objects,
     })
 }
 
@@ -838,43 +966,22 @@ pub async fn mark_archive_blob_reachable(
     store: &dyn ObjectStore,
     marked: &mut HashSet<String>,
 ) -> Result<()> {
-    for meta in store.list_prefix("v1/archive/checkpoints").await? {
-        if !meta.path.ends_with("archive-manifest.json") {
-            continue;
-        }
-        marked.insert(meta.path.clone());
-        let Ok(bytes) = store.get(&meta.path).await else {
-            continue;
-        };
-        let Ok(archive) = serde_json::from_slice::<SignedArchiveManifest>(&bytes) else {
-            continue;
-        };
-        let Some((archive_dir, _)) = meta.path.rsplit_once('/') else {
-            continue;
-        };
-        for artifact in &archive.body.artifacts {
-            marked.insert(format!("{archive_dir}/{}", artifact.path));
-        }
-        marked.insert(archive.body.state_snapshot.manifest_path.clone());
-        if let Ok(state_bytes) = store.get(&archive.body.state_snapshot.manifest_path).await {
-            if let Ok(state) = serde_json::from_slice::<SignedManifest>(&state_bytes) {
-                if let Some((state_dir, _)) =
-                    archive.body.state_snapshot.manifest_path.rsplit_once('/')
-                {
-                    for artifact in state.body.artifacts {
-                        marked.insert(format!("{state_dir}/{}", artifact.path));
-                    }
-                }
+    for prefix in ["v1/archive/pointers", "v1/archive/pins"] {
+        for meta in store.list_prefix(prefix).await? {
+            if !meta.path.ends_with(".json") {
+                continue;
             }
-        }
-        marked.insert(archive.body.blob_coverage.coverage_manifest_path.clone());
-        if let Ok(coverage_bytes) = store
-            .get(&archive.body.blob_coverage.coverage_manifest_path)
-            .await
-        {
-            if let Ok(coverage) = serde_json::from_slice::<SignedBlobCoverage>(&coverage_bytes) {
-                mark_coverage_reachable(store, marked, &coverage).await?;
+            marked.insert(meta.path.clone());
+            let Ok(bytes) = store.get(&meta.path).await else {
+                continue;
+            };
+            let Ok(pointer) = serde_json::from_slice::<SignedArchivePointer>(&bytes) else {
+                continue;
+            };
+            if pointer.validate_schema().is_err() {
+                continue;
             }
+            mark_archive_manifest_reachable(store, marked, &pointer.body.manifest_path).await?;
         }
     }
     for meta in store.list_prefix("v1/blobs/coverage").await? {
@@ -885,6 +992,47 @@ pub async fn mark_archive_blob_reachable(
             continue;
         };
         if let Ok(coverage) = serde_json::from_slice::<SignedBlobCoverage>(&bytes) {
+            mark_coverage_reachable(store, marked, &coverage).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn mark_archive_manifest_reachable(
+    store: &dyn ObjectStore,
+    marked: &mut HashSet<String>,
+    manifest_path: &str,
+) -> Result<()> {
+    marked.insert(manifest_path.to_string());
+    let Ok(bytes) = store.get(manifest_path).await else {
+        return Ok(());
+    };
+    let Ok(archive) = serde_json::from_slice::<SignedArchiveManifest>(&bytes) else {
+        return Ok(());
+    };
+    let Some((archive_dir, _)) = manifest_path.rsplit_once('/') else {
+        return Ok(());
+    };
+    for artifact in &archive.body.artifacts {
+        marked.insert(format!("{archive_dir}/{}", artifact.path));
+    }
+    marked.insert(archive.body.state_snapshot.manifest_path.clone());
+    if let Ok(state_bytes) = store.get(&archive.body.state_snapshot.manifest_path).await {
+        if let Ok(state) = serde_json::from_slice::<SignedManifest>(&state_bytes) {
+            if let Some((state_dir, _)) = archive.body.state_snapshot.manifest_path.rsplit_once('/')
+            {
+                for artifact in state.body.artifacts {
+                    marked.insert(format!("{state_dir}/{}", artifact.path));
+                }
+            }
+        }
+    }
+    marked.insert(archive.body.blob_coverage.coverage_manifest_path.clone());
+    if let Ok(coverage_bytes) = store
+        .get(&archive.body.blob_coverage.coverage_manifest_path)
+        .await
+    {
+        if let Ok(coverage) = serde_json::from_slice::<SignedBlobCoverage>(&coverage_bytes) {
             mark_coverage_reachable(store, marked, &coverage).await?;
         }
     }
@@ -914,10 +1062,26 @@ async fn verify_coverage_ranges(
     store: &dyn ObjectStore,
     coverage: &SignedBlobCoverage,
     trust: &HashMap<String, TrustKey>,
-) -> Result<usize> {
+) -> Result<CoverageProof> {
+    verify_coverage_ranges_inner(store, coverage, Some(trust)).await
+}
+
+async fn verify_coverage_ranges_without_signatures(
+    store: &dyn ObjectStore,
+    coverage: &SignedBlobCoverage,
+) -> Result<CoverageProof> {
+    verify_coverage_ranges_inner(store, coverage, None).await
+}
+
+async fn verify_coverage_ranges_inner(
+    store: &dyn ObjectStore,
+    coverage: &SignedBlobCoverage,
+    trust: Option<&HashMap<String, TrustKey>>,
+) -> Result<CoverageProof> {
     let mut previous_sha = None;
     let mut expected_from = coverage.body.from_height;
     let mut seen_objects = BTreeSet::new();
+    let mut block_hashes = BTreeMap::new();
     for range_ref in &coverage.body.ranges {
         if range_ref.from_height != expected_from {
             bail!("coverage range gap or overlap");
@@ -932,7 +1096,9 @@ async fn verify_coverage_ranges(
         }
         let range: SignedBlobRange = serde_json::from_slice(&bytes)?;
         range.validate_schema()?;
-        range.verify_signature(trust)?;
+        if let Some(trust) = trust {
+            range.verify_signature(trust)?;
+        }
         if range.body.network != coverage.body.network {
             bail!("range network does not match coverage network");
         }
@@ -948,9 +1114,10 @@ async fn verify_coverage_ranges(
         }
         let represented = represented_range_blocks(&range)?;
         for height in range.body.from_height..=range.body.to_height {
-            if !represented.contains_key(&height) {
+            let Some(block_hash) = represented.get(&height) else {
                 bail!("range missing represented height {height}");
-            }
+            };
+            block_hashes.insert(height, block_hash.clone());
         }
         for blob in range.body.entries.iter().flat_map(|entry| &entry.blobs) {
             verify_remote_blob(store, blob).await?;
@@ -959,7 +1126,10 @@ async fn verify_coverage_ranges(
         expected_from = range.body.to_height + 1;
         previous_sha = Some(actual_sha);
     }
-    Ok(seen_objects.len())
+    Ok(CoverageProof {
+        blob_objects: seen_objects.len(),
+        block_hashes,
+    })
 }
 
 fn represented_range_blocks(range: &SignedBlobRange) -> Result<BTreeMap<u64, String>> {
@@ -1054,6 +1224,18 @@ fn validate_object_path(path: &str) -> Result<()> {
             .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
     {
         bail!("unsafe object path {path}");
+    }
+    Ok(())
+}
+
+fn validate_path_component(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.contains('/')
+        || value.contains('\\')
+        || value == "."
+        || value == ".."
+    {
+        bail!("unsafe path component {value}");
     }
     Ok(())
 }
@@ -1381,6 +1563,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn archive_complete_checks_checkpoint_hash_inside_extended_coverage() {
+        let fx = build_fixture().await;
+        extend_coverage_past_archive_with_wrong_checkpoint_hash(&fx);
+        assert!(
+            verify_archive_complete(&fx.store, &fx.archive_manifest_path, 5, &fx.trust)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("archive height")
+        );
+    }
+
+    #[tokio::test]
     async fn archive_restore_installs_matching_state_archive_and_refuses_bad_inputs() {
         let fx = build_fixture().await;
         let destination = fx.tmp.path().join("restored-profile");
@@ -1543,6 +1738,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coverage_publish_writes_manifest_only_after_remote_dependencies_verify() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local_root = tmp.path().join("local");
+        let store_root = tmp.path().join("store");
+        let chain = tmp.path().join("chain.db");
+        fs::create_dir_all(chain.join("blob-blocks")).unwrap();
+        fs::create_dir_all(chain.join("blobs")).unwrap();
+        let blob = chain.join("blobs/blob-0.bin");
+        fs::write(&blob, b"real blob").unwrap();
+        write_descriptor(
+            &chain,
+            0,
+            &[blob.strip_prefix(&chain).unwrap().to_path_buf()],
+        );
+        write_descriptor(&chain, 1, &[]);
+
+        let range = pack_blob_range(PackBlobRangeOptions {
+            network: NETWORK.to_string(),
+            from_height: 0,
+            to_height: 1,
+            chain_db_dir: chain,
+            out: local_root.clone(),
+            previous_range_sha256: None,
+            signing_key: None,
+            key_id: None,
+        })
+        .unwrap();
+        let coverage = write_blob_coverage(
+            &local_root,
+            NETWORK,
+            std::slice::from_ref(&range),
+            None,
+            None,
+        )
+        .unwrap();
+        let store = FileStore::new(&store_root);
+        assert!(publish_blob_coverage(&store, &coverage)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("read object"));
+
+        publish_blob_range(&store, &range).await.unwrap();
+        let remote = publish_blob_coverage(&store, &coverage).await.unwrap();
+        assert!(remote.starts_with("v1/blobs/coverage/"));
+        assert!(store.exists(&remote).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn archive_complete_rejects_checkpoint_drift_and_incomplete_coverage() {
         let state_drift = build_fixture().await;
         mutate_archive(
@@ -1697,6 +1941,16 @@ mod tests {
     #[tokio::test]
     async fn gc_keeps_archive_reachable_state_ranges_and_blob_objects() {
         let fx = build_fixture().await;
+        promote_archive_manifest(
+            &fx.store,
+            &fx.archive_manifest_path,
+            "latest",
+            SEED1,
+            "k1",
+            &fx.trust,
+        )
+        .await
+        .unwrap();
         fx.store
             .put("v1/blobs/objects/ff/ff/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", b"orphan")
             .await
@@ -1726,6 +1980,11 @@ mod tests {
         .await
         .unwrap();
         assert!(fx.store.exists(&fx.archive_manifest_path).await.unwrap());
+        assert!(fx
+            .store
+            .exists("v1/archive/pointers/latest.json")
+            .await
+            .unwrap());
         assert!(fx.store.exists(&fx.state_manifest_path).await.unwrap());
         assert!(fx.store.exists(&fx.coverage_path).await.unwrap());
         assert!(fx.store.exists(&fx.blob_object_path).await.unwrap());
@@ -1983,6 +2242,79 @@ mod tests {
 
     fn resign_archive(archive: &mut SignedArchiveManifest) {
         archive.signature = Some(signing::sign_body(&archive.body, "k1", SEED1).unwrap());
+    }
+
+    fn resign_range(range: &mut SignedBlobRange) {
+        range.signature = Some(signing::sign_body(&range.body, "k1", SEED1).unwrap());
+    }
+
+    fn extend_coverage_past_archive_with_wrong_checkpoint_hash(fx: &Fixture) {
+        let coverage_bytes = fs::read(fx.store_root.join(&fx.coverage_path)).unwrap();
+        let mut coverage: SignedBlobCoverage = serde_json::from_slice(&coverage_bytes).unwrap();
+        let range2_ref = coverage.body.ranges[1].clone();
+        let range2_path = fx.store_root.join(&range2_ref.path);
+        let mut range2: SignedBlobRange =
+            serde_json::from_slice(&fs::read(&range2_path).unwrap()).unwrap();
+        let wrong_hash = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        range2.body.entries[1].block_hash = wrong_hash.to_string();
+        range2.body.to_block_hash = wrong_hash.to_string();
+        resign_range(&mut range2);
+        fs::write(&range2_path, serde_json::to_vec_pretty(&range2).unwrap()).unwrap();
+        let range2_sha = hashing::sha256_bytes(&fs::read(&range2_path).unwrap());
+
+        let mut range3 = SignedBlobRange {
+            body: BlobRangeBody {
+                format: BLOB_RANGE_FORMAT.to_string(),
+                network: NETWORK.to_string(),
+                from_height: 5,
+                to_height: 5,
+                from_block_hash: block_hash(5),
+                to_block_hash: block_hash(5),
+                entries: vec![],
+                empty_blocks: vec![EmptyBlockEntry {
+                    height: 5,
+                    block_hash: block_hash(5),
+                }],
+                previous_range_sha256: Some(range2_sha.clone()),
+            },
+            signature: None,
+        };
+        resign_range(&mut range3);
+        let range3_path = blob_range_path(5, 5);
+        let range3_full = fx.store_root.join(&range3_path);
+        fs::create_dir_all(range3_full.parent().unwrap()).unwrap();
+        fs::write(&range3_full, serde_json::to_vec_pretty(&range3).unwrap()).unwrap();
+        let range3_sha = hashing::sha256_bytes(&fs::read(&range3_full).unwrap());
+
+        coverage.body.ranges[1].sha256 = range2_sha;
+        coverage.body.ranges[1].to_block_hash = wrong_hash.to_string();
+        coverage.body.ranges.push(BlobCoverageRangeRef {
+            path: range3_path,
+            sha256: range3_sha,
+            from_height: 5,
+            to_height: 5,
+            from_block_hash: block_hash(5),
+            to_block_hash: block_hash(5),
+        });
+        coverage.body.to_height = 5;
+        coverage.body.to_block_hash = block_hash(5);
+        resign_coverage(&mut coverage);
+        let new_coverage_path = blob_coverage_path(5, &block_hash(5));
+        fs::write(
+            fx.store_root.join(&new_coverage_path),
+            serde_json::to_vec_pretty(&coverage).unwrap(),
+        )
+        .unwrap();
+        let new_coverage_sha =
+            hashing::sha256_bytes(&fs::read(fx.store_root.join(&new_coverage_path)).unwrap());
+
+        mutate_archive(&fx.store_root, &fx.archive_manifest_path, |archive| {
+            archive.body.blob_coverage.coverage_manifest_path = new_coverage_path;
+            archive.body.blob_coverage.coverage_manifest_sha256 = new_coverage_sha;
+            archive.body.blob_coverage.to_height = 5;
+            archive.body.blob_coverage.to_block_hash = block_hash(5);
+            resign_archive(archive);
+        });
     }
 
     fn write_unsafe_archive(path: &Path) {

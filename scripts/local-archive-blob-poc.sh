@@ -299,6 +299,10 @@ RANGE1_MANIFEST="$(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs
   --out "$LOCAL" \
   $(sign_args))"
 RANGE1_SHA="$(sha256sum "$RANGE1_MANIFEST" | awk '{print $1}')"
+cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs-publish-range \
+  --config "$WORKDIR/config.toml" \
+  --target local_poc \
+  "$RANGE1_MANIFEST" >/dev/null
 COVERAGE_H1_MANIFEST="$(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs-write-coverage \
   --network "$NETWORK" \
   --out "$LOCAL" \
@@ -306,6 +310,10 @@ COVERAGE_H1_MANIFEST="$(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- 
   "$RANGE1_MANIFEST")"
 COVERAGE_H1_REL="${COVERAGE_H1_MANIFEST#"$LOCAL/"}"
 COVERAGE_H1_SHA="$(sha256sum "$COVERAGE_H1_MANIFEST" | awk '{print $1}')"
+cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs-publish-coverage \
+  --config "$WORKDIR/config.toml" \
+  --target local_poc \
+  "$COVERAGE_H1_MANIFEST" >/dev/null
 
 echo "packing H1 archive checkpoint"
 cargo run --manifest-path "$ROOT/Cargo.toml" -- archive-pack \
@@ -327,6 +335,15 @@ cargo run --manifest-path "$ROOT/Cargo.toml" -- archive-pack \
 
 ARCHIVE_MANIFEST="$(find "$LOCAL/v1/archive/checkpoints" -name archive-manifest.json | sort | tail -1)"
 ARCHIVE_REL="${ARCHIVE_MANIFEST#"$LOCAL/"}"
+mkdir -p "$STORE/v1/archive"
+cp -a "$LOCAL/v1/archive/." "$STORE/v1/archive/"
+if [[ -n "$SIGNING_KEY" ]]; then
+  cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- archive-promote \
+    --config "$WORKDIR/config.toml" \
+    --target local_poc \
+    --archive-manifest "$ARCHIVE_REL" \
+    --label latest >/dev/null
+fi
 ORIGINAL_H1_EVENTS="$WORKDIR/original-h1-events.json"
 graphql "{ contractEvents(height: $H1) { json } }" | jq -S . > "$ORIGINAL_H1_EVENTS"
 
@@ -353,15 +370,22 @@ RANGE2_MANIFEST="$(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs
   --out "$LOCAL" \
   --previous-range-sha256 "$RANGE1_SHA" \
   $(sign_args))"
+cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs-publish-range \
+  --config "$WORKDIR/config.toml" \
+  --target local_poc \
+  "$RANGE2_MANIFEST" >/dev/null
 COVERAGE_H2_MANIFEST="$(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs-write-coverage \
   --network "$NETWORK" \
   --out "$LOCAL" \
   $(sign_args) \
   "$RANGE1_MANIFEST" "$RANGE2_MANIFEST")"
 COVERAGE_H2_REL="${COVERAGE_H2_MANIFEST#"$LOCAL/"}"
+cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs-publish-coverage \
+  --config "$WORKDIR/config.toml" \
+  --target local_poc \
+  "$COVERAGE_H2_MANIFEST" >/dev/null
 
-echo "publishing local object tree and verifying completeness"
-cp -a "$LOCAL/v1" "$STORE/"
+echo "verifying completeness from published manifests"
 cargo run --manifest-path "$ROOT/Cargo.toml" -- verify-archive-complete \
   --config "$WORKDIR/config.toml" \
   --source local_poc \

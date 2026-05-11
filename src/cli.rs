@@ -26,12 +26,16 @@ pub enum Command {
     BlobsPackRange(BlobsPackRangeArgs),
     /// Experimental archive/blob POC: publish a packed blob range and its objects.
     BlobsPublishRange(BlobsPublishRangeArgs),
+    /// Experimental archive/blob POC: publish a coverage manifest after dependencies exist.
+    BlobsPublishCoverage(BlobsPublishCoverageArgs),
     /// Experimental archive/blob POC: write a coverage manifest from packed range manifests.
     BlobsWriteCoverage(BlobsWriteCoverageArgs),
     /// Experimental archive/blob POC: verify signed contiguous blob coverage.
     BlobsVerifyCoverage(BlobsVerifyCoverageArgs),
     /// Experimental archive/blob POC: pack an archive checkpoint artifact and manifest.
     ArchivePack(ArchivePackArgs),
+    /// Experimental archive/blob POC: promote an archive checkpoint as an explicit GC root.
+    ArchivePromote(ArchivePromoteArgs),
     /// Experimental archive/blob POC: verify archive/state/blob checkpoint completeness.
     VerifyArchiveComplete(VerifyArchiveCompleteArgs),
     /// Experimental archive/blob POC: restore matching state and archive artifacts.
@@ -328,6 +332,15 @@ pub struct BlobsPublishRangeArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct BlobsPublishCoverageArgs {
+    #[arg(long)]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub target: String,
+    pub manifest: PathBuf,
+}
+
+#[derive(Debug, Args)]
 pub struct BlobsWriteCoverageArgs {
     #[arg(long)]
     pub network: String,
@@ -388,6 +401,19 @@ pub struct ArchivePackArgs {
     pub signing_key: Option<String>,
     #[arg(long)]
     pub key_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ArchivePromoteArgs {
+    #[arg(long)]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub target: String,
+    #[arg(long)]
+    pub archive_manifest: String,
+    /// Archive retention root label. Supported labels: latest, pin:<name>.
+    #[arg(long)]
+    pub label: String,
 }
 
 #[derive(Debug, Args)]
