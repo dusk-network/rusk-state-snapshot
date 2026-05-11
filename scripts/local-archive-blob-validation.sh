@@ -297,7 +297,7 @@ Expected workflow:
        RUSK_DEV_ARGS='--http-listen' make run-dev-archive
   2. In another shell, set paths for that local node, for example:
        export STATE_DIR=/tmp/example.state
-       export CHAIN_DB_DIR=/tmp/example.state
+       export CHAIN_DB_DIR=/tmp/example.chain.db
        export ARCHIVE_DIR=/tmp/example.state/archive
   3. Re-run this script.
 EOF
@@ -335,7 +335,7 @@ RANGE1_MANIFEST="$(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs
   --network "$NETWORK" \
   --from-height "$FROM_HEIGHT" \
   --to-height "$H1" \
-  --chain-db-dir "$DESCRIPTORS" \
+  --descriptor-dir "$DESCRIPTORS" \
   --out "$LOCAL" \
   $(sign_args))"
 RANGE1_SHA="$(sha256sum "$RANGE1_MANIFEST" | awk '{print $1}')"
@@ -413,7 +413,7 @@ RANGE2_MANIFEST="$(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -- blobs
   --network "$NETWORK" \
   --from-height "$NEXT_FROM" \
   --to-height "$H2" \
-  --chain-db-dir "$DESCRIPTORS" \
+  --descriptor-dir "$DESCRIPTORS" \
   --out "$LOCAL" \
   --previous-range-sha256 "$RANGE1_SHA" \
   $(sign_args))"

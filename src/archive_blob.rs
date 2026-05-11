@@ -166,7 +166,16 @@ pub struct ChainBlockDescriptor {
     pub height: u64,
     pub block_hash: String,
     #[serde(default)]
-    pub blobs: Vec<PathBuf>,
+    pub blobs: Vec<ChainBlobDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainBlobDescriptor {
+    pub chain_blob_hash: String,
+    pub path: PathBuf,
+    pub content_blake3: String,
+    pub sha256: String,
+    pub size: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,7 +220,7 @@ pub struct PackBlobRangeOptions {
     pub network: String,
     pub from_height: u64,
     pub to_height: u64,
-    pub chain_db_dir: PathBuf,
+    pub descriptor_dir: PathBuf,
     pub out: PathBuf,
     pub previous_range_sha256: Option<String>,
     pub signing_key: Option<String>,
@@ -559,8 +568,22 @@ pub async fn export_blob_range(opts: ExportBlobRangeOptions) -> Result<PathBuf> 
             if bytes.is_empty() {
                 bail!("blob sidecar {blob_hash} was empty");
             }
+            let content_blake3 = blake3::hash(&bytes).to_hex().to_string();
+            if content_blake3 != blob_hash.to_ascii_lowercase() {
+                bail!(
+                    "downloaded sidecar hash mismatch for chain blob {blob_hash}: got blake3:{content_blake3}"
+                );
+            }
+            let sha256 = hashing::sha256_bytes(&bytes);
+            let size = bytes.len() as u64;
             fs::write(&local, bytes)?;
-            blob_paths.push(rel);
+            blob_paths.push(ChainBlobDescriptor {
+                chain_blob_hash: blob_hash,
+                path: rel,
+                content_blake3,
+                sha256,
+                size,
+            });
         }
 
         let descriptor = ChainBlockDescriptor {
@@ -631,7 +654,7 @@ pub fn pack_blob_range(opts: PackBlobRangeOptions) -> Result<PathBuf> {
     fs::create_dir_all(&object_root)?;
 
     for height in opts.from_height..=opts.to_height {
-        let desc = read_block_descriptor(&opts.chain_db_dir, height)?;
+        let desc = read_block_descriptor(&opts.descriptor_dir, height)?;
         if desc.height != height {
             bail!(
                 "block descriptor height mismatch: expected {height}, got {}",
@@ -648,13 +671,17 @@ pub fn pack_blob_range(opts: PackBlobRangeOptions) -> Result<PathBuf> {
         }
 
         let mut blobs = Vec::new();
-        for blob_path in desc.blobs {
-            let full = if blob_path.is_absolute() {
-                blob_path
-            } else {
-                opts.chain_db_dir.join(blob_path)
-            };
+        for blob in desc.blobs {
+            verify_chain_blob_descriptor(&blob)?;
+            let full = opts.descriptor_dir.join(&blob.path);
             let hashes = hashing::hash_file(&full)?;
+            if hashes.blake3 != blob.content_blake3
+                || hashes.blake3 != blob.chain_blob_hash.to_ascii_lowercase()
+                || hashes.sha256 != blob.sha256
+                || hashes.size != blob.size
+            {
+                bail!("blob descriptor hash mismatch for {}", full.display());
+            }
             let object_path = blob_object_path(&hashes.blake3)?;
             let local_object = opts.out.join(&object_path);
             if !local_object.exists() {
@@ -1478,12 +1505,22 @@ fn represented_range_blocks(range: &SignedBlobRange) -> Result<BTreeMap<u64, Str
     Ok(represented)
 }
 
-fn read_block_descriptor(chain_db_dir: &Path, height: u64) -> Result<ChainBlockDescriptor> {
-    let path = chain_db_dir
+fn read_block_descriptor(descriptor_dir: &Path, height: u64) -> Result<ChainBlockDescriptor> {
+    let path = descriptor_dir
         .join("blob-blocks")
         .join(format!("h{height:09}.json"));
     let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+}
+
+fn verify_chain_blob_descriptor(blob: &ChainBlobDescriptor) -> Result<()> {
+    require_hex("chain blob hash", &blob.chain_blob_hash, 32)?;
+    require_hex("content blake3", &blob.content_blake3, 32)?;
+    require_hex("blob sha256", &blob.sha256, 32)?;
+    if blob.chain_blob_hash.to_ascii_lowercase() != blob.content_blake3 {
+        bail!("chain blob hash does not match descriptor content blake3");
+    }
+    validate_descriptor_blob_path(&blob.path)
 }
 
 fn create_archive_artifact(archive_dir: &Path, out: &Path) -> Result<()> {
@@ -1559,6 +1596,18 @@ fn validate_object_path(path: &str) -> Result<()> {
             .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
     {
         bail!("unsafe object path {path}");
+    }
+    Ok(())
+}
+
+fn validate_descriptor_blob_path(path: &Path) -> Result<()> {
+    if path.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir
+        )
+    }) {
+        bail!("unsafe descriptor blob path {}", path.display());
     }
     Ok(())
 }
@@ -2101,7 +2150,7 @@ mod tests {
             network: NETWORK.to_string(),
             from_height: 0,
             to_height: 1,
-            chain_db_dir: chain,
+            descriptor_dir: chain,
             out: local_root.clone(),
             previous_range_sha256: None,
             signing_key: None,
@@ -2127,6 +2176,47 @@ mod tests {
         let remote = publish_blob_coverage(&store, &coverage).await.unwrap();
         assert!(remote.starts_with("v1/blobs/coverage/"));
         assert!(store.exists(&remote).await.unwrap());
+    }
+
+    #[test]
+    fn blob_pack_rejects_descriptor_disconnected_from_chain_blob_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local_root = tmp.path().join("local");
+        let chain = tmp.path().join("chain.db");
+        fs::create_dir_all(chain.join("blob-blocks")).unwrap();
+        fs::create_dir_all(chain.join("blobs")).unwrap();
+        let blob = chain.join("blobs/blob-0.bin");
+        fs::write(&blob, b"real chain blob").unwrap();
+        write_descriptor(
+            &chain,
+            0,
+            &[blob.strip_prefix(&chain).unwrap().to_path_buf()],
+        );
+
+        let descriptor_path = chain.join("blob-blocks/h000000000.json");
+        let mut descriptor: ChainBlockDescriptor =
+            serde_json::from_slice(&fs::read(&descriptor_path).unwrap()).unwrap();
+        descriptor.blobs[0].chain_blob_hash =
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string();
+        fs::write(
+            &descriptor_path,
+            serde_json::to_vec_pretty(&descriptor).unwrap(),
+        )
+        .unwrap();
+
+        let err = pack_blob_range(PackBlobRangeOptions {
+            network: NETWORK.to_string(),
+            from_height: 0,
+            to_height: 0,
+            descriptor_dir: chain,
+            out: local_root,
+            previous_range_sha256: None,
+            signing_key: None,
+            key_id: None,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("chain blob hash"));
     }
 
     #[tokio::test]
@@ -2420,7 +2510,7 @@ mod tests {
             network: NETWORK.to_string(),
             from_height: 0,
             to_height: 2,
-            chain_db_dir: chain.clone(),
+            descriptor_dir: chain.clone(),
             out: local_root.clone(),
             previous_range_sha256: None,
             signing_key: Some(SEED1.to_string()),
@@ -2432,7 +2522,7 @@ mod tests {
             network: NETWORK.to_string(),
             from_height: 3,
             to_height: 4,
-            chain_db_dir: chain.clone(),
+            descriptor_dir: chain.clone(),
             out: local_root.clone(),
             previous_range_sha256: Some(range1_sha),
             signing_key: Some(SEED1.to_string()),
@@ -2540,10 +2630,24 @@ mod tests {
     }
 
     fn write_descriptor(chain: &Path, height: u64, blobs: &[PathBuf]) {
+        let blobs = blobs
+            .iter()
+            .map(|path| {
+                let full = chain.join(path);
+                let hashes = hashing::hash_file(&full).unwrap();
+                ChainBlobDescriptor {
+                    chain_blob_hash: hashes.blake3.clone(),
+                    path: path.clone(),
+                    content_blake3: hashes.blake3,
+                    sha256: hashes.sha256,
+                    size: hashes.size,
+                }
+            })
+            .collect();
         let desc = ChainBlockDescriptor {
             height,
             block_hash: block_hash(height),
-            blobs: blobs.to_vec(),
+            blobs,
         };
         fs::write(
             chain.join("blob-blocks").join(format!("h{height:09}.json")),

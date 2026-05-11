@@ -329,7 +329,7 @@ pub struct BlobsPackRangeArgs {
     pub to_height: u64,
     /// Descriptor directory produced by blobs-export-range. Expects blob-blocks/h#########.json.
     #[arg(long)]
-    pub chain_db_dir: PathBuf,
+    pub descriptor_dir: PathBuf,
     #[arg(long)]
     pub out: PathBuf,
     #[arg(long)]

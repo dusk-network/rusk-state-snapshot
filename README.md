@@ -353,6 +353,12 @@ v1/
 blob object before writing the coverage manifest. Coverage manifests are the
 final truth objects for contiguous blob ranges.
 
+`blobs-export-range` queries block headers and transaction blob hashes from a
+Rusk GraphQL node, downloads each sidecar through `/on/blobs:<hash>/hash`, and
+verifies the downloaded bytes hash back to the chain-reported blob hash before
+writing the descriptor. `blobs-pack-range` repeats that descriptor/file hash
+check before creating content-addressed blob objects.
+
 ## Operational Flows
 
 Provisioner snapshots:
@@ -397,7 +403,7 @@ cargo run -- blobs-pack-range \
   --network localnet \
   --from-height 0 \
   --to-height 49 \
-  --chain-db-dir ./target/archive-blob-validation/descriptors \
+  --descriptor-dir ./target/archive-blob-validation/descriptors \
   --out ./target/archive-blob-validation
 
 cargo run -- blobs-write-coverage \
@@ -482,9 +488,10 @@ Unsigned archive/blob data is suitable only for local validation stores.
 against a running local Rusk archive node. It uses `rusk-wallet blob` to submit
 real blob transactions, queries local GraphQL for block hashes and transaction
 blob hashes, downloads sidecar bytes through `/on/blobs:<hash>/hash`, exports
-range descriptors, and then runs state snapshot, blob range/coverage, archive
-pack/publish, archive completeness verification, and manifest-driven restore of
-the matching state/archive artifacts against a local file store.
+range descriptors that bind each sidecar to its chain blob hash, and then runs
+state snapshot, blob range/coverage, archive pack/publish, archive completeness
+verification, and manifest-driven restore of the matching state/archive
+artifacts against a local file store.
 
 The release sign-off mode is:
 

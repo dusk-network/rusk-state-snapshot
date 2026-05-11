@@ -32,7 +32,7 @@ pub async fn blobs_pack_range(args: BlobsPackRangeArgs) -> Result<()> {
         network: args.network,
         from_height: args.from_height,
         to_height: args.to_height,
-        chain_db_dir: args.chain_db_dir,
+        descriptor_dir: args.descriptor_dir,
         out: args.out,
         previous_range_sha256: args.previous_range_sha256,
         signing_key: args.signing_key,
