@@ -266,16 +266,22 @@ never touches local node state. It prunes stale pointers and unreferenced
 artifacts; it does not create daily, monthly, yearly, or latest labels.
 
 On the experimental `poc/archive-blob-retention` branch, `gc` also understands
-archive/blob reachability. A retained archive manifest pins its archive artifact,
-the matching state snapshot manifest and artifact, the blob coverage manifest,
-the signed blob range manifests, and every referenced content-addressed blob
-object. This is branch-local POC behavior and does not make archive/blob capture
-part of the default provisioner snapshot path.
+archive/state reachability. A retained archive manifest pins its archive
+artifact and the matching state snapshot manifest and artifact. This is
+branch-local POC behavior and does not make archive/blob capture part of the
+default provisioner snapshot path.
 
 Archive manifests are not GC roots by filename alone. The POC retains archive
 checkpoints through explicit roots under `v1/archive/pointers/...` or
 `v1/archive/pins/...`; unrooted archive checkpoints are eligible for deletion
 after the configured grace period.
+
+Blob storage is WORM-like. Normal retention GC intentionally does not delete
+`v1/blobs/**`, including blob objects, range manifests, or coverage manifests.
+Operators must also avoid object-store lifecycle policies that expire
+`v1/blobs/**`. Any future blob cleanup must be a separate explicit
+administrative flow, such as `blob-audit` or `blob-prune`, with stronger
+safeguards than snapshot GC.
 
 ## Experimental Archive/Blob POC
 
@@ -394,10 +400,10 @@ range. `archive-promote` writes an explicit archive retention root such as
 only these roots when preserving archive checkpoints and their referenced
 state/blob artifacts.
 
-Blob coverage manifests are not GC roots by filename alone. They are retained
-when reachable from an archive manifest rooted by an archive pointer/pin; an
-unreferenced coverage manifest and its objects can be collected after the grace
-period.
+Blob coverage manifests are not GC roots because they do not need to be:
+`v1/blobs/**` is excluded from normal GC entirely. Verification still requires
+coverage manifests, range manifests, and every referenced blob object to exist
+and hash correctly.
 
 ## Calendar Orchestration
 

@@ -78,7 +78,7 @@ pub async fn run(args: GcArgs) -> Result<()> {
 
     let now = std::time::SystemTime::now();
     let mut deletable = Vec::new();
-    for prefix in ["v1/snapshots", "v1/staging", "v1/archive", "v1/blobs"] {
+    for prefix in ["v1/snapshots", "v1/staging", "v1/archive"] {
         for meta in store.list_prefix(prefix).await? {
             if marked.contains(&meta.path) {
                 continue;

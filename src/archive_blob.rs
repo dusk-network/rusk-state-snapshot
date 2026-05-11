@@ -1665,6 +1665,13 @@ mod tests {
 
         let bad = build_fixture().await;
         bad.store.delete(&bad.blob_object_path).await.unwrap();
+        assert!(
+            verify_archive_complete(&bad.store, &bad.archive_manifest_path, 4, &bad.trust)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("read object")
+        );
         assert!(restore_archive_complete(
             &bad.store,
             &bad.archive_manifest_path,
@@ -1999,7 +2006,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_keeps_archive_reachable_state_ranges_and_blob_objects() {
+    async fn gc_preserves_blob_namespace_and_deletes_unrooted_archive() {
+        let fx = build_fixture().await;
+        let orphan_blob =
+            "v1/blobs/objects/ff/ff/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        fx.store.put(orphan_blob, b"orphan").await.unwrap();
+        let range_path = blob_range_path(0, 2);
+        let archive_artifact = fx
+            .archive_manifest_path
+            .rsplit_once('/')
+            .map(|(dir, _)| format!("{dir}/archive.tar.zst"))
+            .unwrap();
+
+        run_test_gc(&fx).await;
+
+        assert!(fx.store.exists(orphan_blob).await.unwrap());
+        assert!(fx.store.exists(&fx.blob_object_path).await.unwrap());
+        assert!(fx.store.exists(&range_path).await.unwrap());
+        assert!(fx.store.exists(&fx.coverage_path).await.unwrap());
+        assert!(!fx.store.exists(&fx.archive_manifest_path).await.unwrap());
+        assert!(!fx.store.exists(&archive_artifact).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn gc_keeps_archive_rooted_state_snapshot() {
         let fx = build_fixture().await;
         promote_archive_manifest(
             &fx.store,
@@ -2011,34 +2041,14 @@ mod tests {
         )
         .await
         .unwrap();
-        fx.store
-            .put("v1/blobs/objects/ff/ff/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", b"orphan")
-            .await
+        let state_artifact = fx
+            .state_manifest_path
+            .rsplit_once('/')
+            .map(|(dir, _)| format!("{dir}/snapshot.tar.zst"))
             .unwrap();
-        let policy = fx.tmp.path().join("retention.toml");
-        fs::write(
-            &policy,
-            "[rolling]\nkeep_latest=false\nkeep_previous=false\nkeep_daily=0\n[monthly]\nkeep_months=0\nselection='last-good-daily-of-month'\n[yearly]\nkeep_years=0\nselection='december-monthly'\n[gc]\ndelete_grace_period='0s'\ndry_run_default=true\n",
-        )
-        .unwrap();
-        let cfg = fx.tmp.path().join("config.toml");
-        fs::write(
-            &cfg,
-            format!(
-                "[target.local]\nkind='file'\npath='{}'\n",
-                fx.store_root.display()
-            ),
-        )
-        .unwrap();
-        crate::commands::gc::run(crate::cli::GcArgs {
-            target: "local".to_string(),
-            config: cfg,
-            policy,
-            dry_run: false,
-            delete: true,
-        })
-        .await
-        .unwrap();
+
+        run_test_gc(&fx).await;
+
         assert!(fx.store.exists(&fx.archive_manifest_path).await.unwrap());
         assert!(fx
             .store
@@ -2046,13 +2056,9 @@ mod tests {
             .await
             .unwrap());
         assert!(fx.store.exists(&fx.state_manifest_path).await.unwrap());
+        assert!(fx.store.exists(&state_artifact).await.unwrap());
         assert!(fx.store.exists(&fx.coverage_path).await.unwrap());
         assert!(fx.store.exists(&fx.blob_object_path).await.unwrap());
-        assert!(!fx
-            .store
-            .exists("v1/blobs/objects/ff/ff/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
-            .await
-            .unwrap());
     }
 
     #[test]
@@ -2198,6 +2204,33 @@ mod tests {
             state_manifest_path,
             blob_object_path,
         }
+    }
+
+    async fn run_test_gc(fx: &Fixture) {
+        let policy = fx.tmp.path().join("retention.toml");
+        fs::write(
+            &policy,
+            "[rolling]\nkeep_latest=false\nkeep_previous=false\nkeep_daily=0\n[monthly]\nkeep_months=0\nselection='last-good-daily-of-month'\n[yearly]\nkeep_years=0\nselection='december-monthly'\n[gc]\ndelete_grace_period='0s'\ndry_run_default=true\n",
+        )
+        .unwrap();
+        let cfg = fx.tmp.path().join("config.toml");
+        fs::write(
+            &cfg,
+            format!(
+                "[target.local]\nkind='file'\npath='{}'\n",
+                fx.store_root.display()
+            ),
+        )
+        .unwrap();
+        crate::commands::gc::run(crate::cli::GcArgs {
+            target: "local".to_string(),
+            config: cfg,
+            policy,
+            dry_run: false,
+            delete: true,
+        })
+        .await
+        .unwrap();
     }
 
     fn write_descriptor(chain: &Path, height: u64, blobs: &[PathBuf]) {
