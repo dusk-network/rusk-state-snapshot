@@ -93,8 +93,18 @@ import sys
 
 path = pathlib.Path(sys.argv[1])
 idx = int(sys.argv[2])
-pattern = (f"archive-blob-validation-{idx:02d}-".encode() * 8192)[:131072]
-path.write_bytes(pattern.ljust(131072, bytes([idx])))
+seed = f"archive-blob-validation-{idx:02d}-".encode()
+blob = bytearray()
+for field_idx in range(4096):
+    chunk = bytearray(32)
+    chunk[0] = 0
+    chunk[1] = idx & 0xff
+    chunk[2] = (field_idx >> 8) & 0xff
+    chunk[3] = field_idx & 0xff
+    for pos in range(4, 32):
+        chunk[pos] = seed[(field_idx + pos) % len(seed)]
+    blob.extend(chunk)
+path.write_bytes(blob)
 PY
   mkdir -p "$WALLET_DIR"
   if [[ ! -f "$WALLET_DIR/wallet.dat" && -f "$RUSK_REPO/examples/wallet.dat" ]]; then

@@ -568,12 +568,13 @@ pub async fn export_blob_range(opts: ExportBlobRangeOptions) -> Result<PathBuf> 
             if bytes.is_empty() {
                 bail!("blob sidecar {blob_hash} was empty");
             }
-            let content_blake3 = blake3::hash(&bytes).to_hex().to_string();
-            if content_blake3 != blob_hash.to_ascii_lowercase() {
+            let sidecar_chain_hash = sidecar_chain_blob_hash(&bytes)?;
+            if sidecar_chain_hash != blob_hash.to_ascii_lowercase() {
                 bail!(
-                    "downloaded sidecar hash mismatch for chain blob {blob_hash}: got blake3:{content_blake3}"
+                    "downloaded sidecar hash mismatch for chain blob {blob_hash}: got {sidecar_chain_hash}"
                 );
             }
+            let content_blake3 = blake3::hash(&bytes).to_hex().to_string();
             let sha256 = hashing::sha256_bytes(&bytes);
             let size = bytes.len() as u64;
             fs::write(&local, bytes)?;
@@ -675,8 +676,9 @@ pub fn pack_blob_range(opts: PackBlobRangeOptions) -> Result<PathBuf> {
             verify_chain_blob_descriptor(&blob)?;
             let full = opts.descriptor_dir.join(&blob.path);
             let hashes = hashing::hash_file(&full)?;
+            let bytes = fs::read(&full).with_context(|| format!("read {}", full.display()))?;
             if hashes.blake3 != blob.content_blake3
-                || hashes.blake3 != blob.chain_blob_hash.to_ascii_lowercase()
+                || sidecar_chain_blob_hash(&bytes)? != blob.chain_blob_hash.to_ascii_lowercase()
                 || hashes.sha256 != blob.sha256
                 || hashes.size != blob.size
             {
@@ -1517,10 +1519,22 @@ fn verify_chain_blob_descriptor(blob: &ChainBlobDescriptor) -> Result<()> {
     require_hex("chain blob hash", &blob.chain_blob_hash, 32)?;
     require_hex("content blake3", &blob.content_blake3, 32)?;
     require_hex("blob sha256", &blob.sha256, 32)?;
-    if blob.chain_blob_hash.to_ascii_lowercase() != blob.content_blake3 {
-        bail!("chain blob hash does not match descriptor content blake3");
-    }
     validate_descriptor_blob_path(&blob.path)
+}
+
+fn sidecar_chain_blob_hash(bytes: &[u8]) -> Result<String> {
+    const COMMITMENT_LEN: usize = 48;
+    const PROOF_LEN: usize = 48;
+    const DATA_LEN: usize = 4096 * 32;
+    const SIDECAR_LEN: usize = COMMITMENT_LEN + PROOF_LEN + DATA_LEN;
+    if bytes.len() != SIDECAR_LEN {
+        bail!(
+            "blob sidecar length mismatch: expected {SIDECAR_LEN}, got {}",
+            bytes.len()
+        );
+    }
+    let commitment_sha256 = hashing::sha256_bytes(&bytes[..COMMITMENT_LEN]);
+    Ok(format!("01{}", &commitment_sha256[2..]))
 }
 
 fn create_archive_artifact(archive_dir: &Path, out: &Path) -> Result<()> {
@@ -2138,7 +2152,7 @@ mod tests {
         fs::create_dir_all(chain.join("blob-blocks")).unwrap();
         fs::create_dir_all(chain.join("blobs")).unwrap();
         let blob = chain.join("blobs/blob-0.bin");
-        fs::write(&blob, b"real blob").unwrap();
+        fs::write(&blob, test_sidecar_bytes(0)).unwrap();
         write_descriptor(
             &chain,
             0,
@@ -2186,7 +2200,7 @@ mod tests {
         fs::create_dir_all(chain.join("blob-blocks")).unwrap();
         fs::create_dir_all(chain.join("blobs")).unwrap();
         let blob = chain.join("blobs/blob-0.bin");
-        fs::write(&blob, b"real chain blob").unwrap();
+        fs::write(&blob, test_sidecar_bytes(1)).unwrap();
         write_descriptor(
             &chain,
             0,
@@ -2216,7 +2230,7 @@ mod tests {
         })
         .unwrap_err()
         .to_string();
-        assert!(err.contains("chain blob hash"));
+        assert!(err.contains("blob descriptor hash mismatch"));
     }
 
     #[tokio::test]
@@ -2500,7 +2514,7 @@ mod tests {
             let mut blobs = Vec::<PathBuf>::new();
             if matches!(height, 1 | 3 | 4) {
                 let blob = chain.join("blobs").join(format!("blob-{height}.bin"));
-                fs::write(&blob, format!("real blob payload {height}")).unwrap();
+                fs::write(&blob, test_sidecar_bytes(height as u8)).unwrap();
                 blobs.push(blob.strip_prefix(&chain).unwrap().to_path_buf());
             }
             write_descriptor(&chain, height, &blobs);
@@ -2636,7 +2650,7 @@ mod tests {
                 let full = chain.join(path);
                 let hashes = hashing::hash_file(&full).unwrap();
                 ChainBlobDescriptor {
-                    chain_blob_hash: hashes.blake3.clone(),
+                    chain_blob_hash: sidecar_chain_blob_hash(&fs::read(&full).unwrap()).unwrap(),
                     path: path.clone(),
                     content_blake3: hashes.blake3,
                     sha256: hashes.sha256,
@@ -2654,6 +2668,14 @@ mod tests {
             serde_json::to_vec_pretty(&desc).unwrap(),
         )
         .unwrap();
+    }
+
+    fn test_sidecar_bytes(seed: u8) -> Vec<u8> {
+        let mut bytes = vec![0u8; 48 + 48 + 4096 * 32];
+        for (idx, byte) in bytes.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(idx as u8);
+        }
+        bytes
     }
 
     fn write_state_snapshot(root: &Path) -> Result<String> {
