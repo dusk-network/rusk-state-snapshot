@@ -356,8 +356,9 @@ final truth objects for contiguous blob ranges.
 `blobs-export-range` queries block headers and transaction blob hashes from a
 Rusk GraphQL node, downloads each sidecar through `/on/blobs:<hash>/hash`, and
 verifies the sidecar commitment derives the chain-reported versioned KZG blob
-hash before writing the descriptor. `blobs-pack-range` repeats that
-descriptor/file check before creating content-addressed blob objects.
+hash and that the blob data verifies against the commitment/proof before
+writing the descriptor. `blobs-pack-range` repeats those descriptor/file/KZG
+checks before creating content-addressed blob objects.
 
 ## Operational Flows
 

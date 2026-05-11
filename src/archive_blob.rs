@@ -7,6 +7,7 @@ use crate::{
     signing::{SignatureBlock, TrustKey},
 };
 use anyhow::{bail, Context, Result};
+use c_kzg::{ethereum_kzg_settings, Blob as KzgBlob, Bytes48};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -176,6 +177,11 @@ pub struct ChainBlobDescriptor {
     pub content_blake3: String,
     pub sha256: String,
     pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidecarProof {
+    chain_blob_hash: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -568,10 +574,11 @@ pub async fn export_blob_range(opts: ExportBlobRangeOptions) -> Result<PathBuf> 
             if bytes.is_empty() {
                 bail!("blob sidecar {blob_hash} was empty");
             }
-            let sidecar_chain_hash = sidecar_chain_blob_hash(&bytes)?;
-            if sidecar_chain_hash != blob_hash.to_ascii_lowercase() {
+            let sidecar = verify_sidecar_kzg(&bytes)?;
+            if sidecar.chain_blob_hash != blob_hash.to_ascii_lowercase() {
                 bail!(
-                    "downloaded sidecar hash mismatch for chain blob {blob_hash}: got {sidecar_chain_hash}"
+                    "downloaded sidecar hash mismatch for chain blob {blob_hash}: got {}",
+                    sidecar.chain_blob_hash
                 );
             }
             let content_blake3 = blake3::hash(&bytes).to_hex().to_string();
@@ -677,8 +684,9 @@ pub fn pack_blob_range(opts: PackBlobRangeOptions) -> Result<PathBuf> {
             let full = opts.descriptor_dir.join(&blob.path);
             let hashes = hashing::hash_file(&full)?;
             let bytes = fs::read(&full).with_context(|| format!("read {}", full.display()))?;
+            let sidecar = verify_sidecar_kzg(&bytes)?;
             if hashes.blake3 != blob.content_blake3
-                || sidecar_chain_blob_hash(&bytes)? != blob.chain_blob_hash.to_ascii_lowercase()
+                || sidecar.chain_blob_hash != blob.chain_blob_hash.to_ascii_lowercase()
                 || hashes.sha256 != blob.sha256
                 || hashes.size != blob.size
             {
@@ -1537,6 +1545,38 @@ fn sidecar_chain_blob_hash(bytes: &[u8]) -> Result<String> {
     Ok(format!("01{}", &commitment_sha256[2..]))
 }
 
+fn verify_sidecar_kzg(bytes: &[u8]) -> Result<SidecarProof> {
+    const COMMITMENT_LEN: usize = 48;
+    const PROOF_LEN: usize = 48;
+    const DATA_LEN: usize = 4096 * 32;
+    const SIDECAR_LEN: usize = COMMITMENT_LEN + PROOF_LEN + DATA_LEN;
+    if bytes.len() != SIDECAR_LEN {
+        bail!(
+            "blob sidecar length mismatch: expected {SIDECAR_LEN}, got {}",
+            bytes.len()
+        );
+    }
+    let commitment: [u8; COMMITMENT_LEN] = bytes[..COMMITMENT_LEN]
+        .try_into()
+        .expect("commitment slice length is fixed");
+    let proof: [u8; PROOF_LEN] = bytes[COMMITMENT_LEN..COMMITMENT_LEN + PROOF_LEN]
+        .try_into()
+        .expect("proof slice length is fixed");
+    let blob =
+        KzgBlob::from_bytes(&bytes[COMMITMENT_LEN + PROOF_LEN..]).context("parse KZG blob data")?;
+    let commitment_bytes = Bytes48::new(commitment);
+    let proof_bytes = Bytes48::new(proof);
+    let valid = ethereum_kzg_settings(0)
+        .verify_blob_kzg_proof(&blob, &commitment_bytes, &proof_bytes)
+        .context("verify blob KZG proof")?;
+    if !valid {
+        bail!("blob KZG proof verification failed");
+    }
+    Ok(SidecarProof {
+        chain_blob_hash: sidecar_chain_blob_hash(bytes)?,
+    })
+}
+
 fn create_archive_artifact(archive_dir: &Path, out: &Path) -> Result<()> {
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
@@ -1640,7 +1680,10 @@ fn validate_path_component(value: &str) -> Result<()> {
 
 fn verify_local_blob(path: &Path, blob: &BlobObjectRef) -> Result<()> {
     let hashes = hashing::hash_file(path)?;
-    verify_hashes(&hashes, blob.size, &blob.sha256, &blob.hash)
+    verify_hashes(&hashes, blob.size, &blob.sha256, &blob.hash)?;
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    verify_sidecar_kzg(&bytes)?;
+    Ok(())
 }
 
 async fn verify_remote_blob(store: &dyn ObjectStore, blob: &BlobObjectRef) -> Result<()> {
@@ -1656,7 +1699,9 @@ async fn verify_remote_blob(store: &dyn ObjectStore, blob: &BlobObjectRef) -> Re
         blob.size,
         &blob.sha256,
         &blob.hash,
-    )
+    )?;
+    verify_sidecar_kzg(&bytes)?;
+    Ok(())
 }
 
 async fn verify_remote_file_hashes(
@@ -2233,6 +2278,26 @@ mod tests {
         assert!(err.contains("blob descriptor hash mismatch"));
     }
 
+    #[test]
+    fn sidecar_kzg_verification_rejects_corruption() {
+        let valid = test_sidecar_bytes(9);
+        verify_sidecar_kzg(&valid).unwrap();
+
+        let mut bad_commitment = valid.clone();
+        bad_commitment[0] ^= 1;
+        assert!(verify_sidecar_kzg(&bad_commitment).is_err());
+
+        let mut bad_proof = valid.clone();
+        bad_proof[48] ^= 1;
+        assert!(verify_sidecar_kzg(&bad_proof).is_err());
+
+        let mut bad_data = valid.clone();
+        bad_data[96 + 128] ^= 1;
+        assert!(verify_sidecar_kzg(&bad_data).is_err());
+
+        assert!(verify_sidecar_kzg(&valid[..valid.len() - 1]).is_err());
+    }
+
     #[tokio::test]
     async fn archive_publish_uploads_artifact_before_manifest_and_promote_hashes_artifact() {
         let fx = build_fixture().await;
@@ -2671,10 +2736,26 @@ mod tests {
     }
 
     fn test_sidecar_bytes(seed: u8) -> Vec<u8> {
-        let mut bytes = vec![0u8; 48 + 48 + 4096 * 32];
-        for (idx, byte) in bytes.iter_mut().enumerate() {
-            *byte = seed.wrapping_add(idx as u8);
+        const DATA_LEN: usize = 4096 * 32;
+        let mut data = vec![0u8; DATA_LEN];
+        for field_idx in 0..4096 {
+            let offset = field_idx * 32;
+            data[offset] = 0;
+            data[offset + 1] = seed;
+            data[offset + 2] = (field_idx >> 8) as u8;
+            data[offset + 3] = field_idx as u8;
+            for pos in 4..32 {
+                data[offset + pos] = seed.wrapping_add(field_idx as u8).wrapping_add(pos as u8);
+            }
         }
+        let blob = KzgBlob::from_bytes(&data).unwrap();
+        let settings = ethereum_kzg_settings(0);
+        let commitment = settings.blob_to_kzg_commitment(&blob).unwrap().to_bytes();
+        let proof = settings.compute_blob_kzg_proof(&blob, &commitment).unwrap();
+        let mut bytes = Vec::with_capacity(48 + 48 + DATA_LEN);
+        bytes.extend(commitment.into_inner());
+        bytes.extend(proof.to_bytes().into_inner());
+        bytes.extend(data);
         bytes
     }
 
