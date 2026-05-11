@@ -26,6 +26,7 @@ pub const ARCHIVE_POINTER_FORMAT: &str = "rusk-archive-pointer/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlobObjectRef {
+    pub chain_blob_hash: String,
     pub hash: String,
     pub sha256: String,
     pub size: u64,
@@ -702,6 +703,7 @@ pub fn pack_blob_range(opts: PackBlobRangeOptions) -> Result<PathBuf> {
                     .with_context(|| format!("copy blob object {}", full.display()))?;
             }
             blobs.push(BlobObjectRef {
+                chain_blob_hash: blob.chain_blob_hash.to_ascii_lowercase(),
                 hash: format!("blake3:{}", hashes.blake3),
                 sha256: hashes.sha256,
                 size: hashes.size,
@@ -1628,6 +1630,7 @@ fn is_forbidden_archive_input(path: &Path) -> bool {
 }
 
 fn validate_blob_ref(blob: &BlobObjectRef) -> Result<()> {
+    require_hex("chain blob hash", &blob.chain_blob_hash, 32)?;
     let hash = blob
         .hash
         .strip_prefix("blake3:")
@@ -1682,7 +1685,10 @@ fn verify_local_blob(path: &Path, blob: &BlobObjectRef) -> Result<()> {
     let hashes = hashing::hash_file(path)?;
     verify_hashes(&hashes, blob.size, &blob.sha256, &blob.hash)?;
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    verify_sidecar_kzg(&bytes)?;
+    let sidecar = verify_sidecar_kzg(&bytes)?;
+    if sidecar.chain_blob_hash != blob.chain_blob_hash.to_ascii_lowercase() {
+        bail!("blob chain hash does not match sidecar commitment");
+    }
     Ok(())
 }
 
@@ -1700,7 +1706,10 @@ async fn verify_remote_blob(store: &dyn ObjectStore, blob: &BlobObjectRef) -> Re
         &blob.sha256,
         &blob.hash,
     )?;
-    verify_sidecar_kzg(&bytes)?;
+    let sidecar = verify_sidecar_kzg(&bytes)?;
+    if sidecar.chain_blob_hash != blob.chain_blob_hash.to_ascii_lowercase() {
+        bail!("blob chain hash does not match sidecar commitment");
+    }
     Ok(())
 }
 
@@ -2186,6 +2195,49 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn blob_coverage_rejects_chain_hash_disconnected_from_sidecar() {
+        let fx = build_fixture().await;
+        let coverage_path = fx.store_root.join(&fx.coverage_path);
+        let mut coverage: SignedBlobCoverage =
+            serde_json::from_slice(&fs::read(&coverage_path).unwrap()).unwrap();
+        let range_path = coverage.body.ranges[0].path.clone();
+        let local_range_path = fx.store_root.join(&range_path);
+        let mut range: SignedBlobRange =
+            serde_json::from_slice(&fs::read(&local_range_path).unwrap()).unwrap();
+
+        range.body.entries[0].blobs[0].chain_blob_hash =
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string();
+        resign_range(&mut range);
+        let range_bytes = serde_json::to_vec_pretty(&range).unwrap();
+        fs::write(&local_range_path, &range_bytes).unwrap();
+
+        coverage.body.ranges[0].sha256 = hashing::sha256_bytes(&range_bytes);
+        resign_coverage(&mut coverage);
+        fs::write(
+            &coverage_path,
+            serde_json::to_vec_pretty(&coverage).unwrap(),
+        )
+        .unwrap();
+
+        let err = verify_blob_coverage_with_options(
+            &fx.store,
+            &fx.coverage_path,
+            0,
+            4,
+            &fx.trust,
+            ArchiveBlobVerifyOptions {
+                require_signed_blob_ranges: true,
+                require_signed_blob_coverage: true,
+                ..ArchiveBlobVerifyOptions::default()
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("chain hash does not match sidecar"));
     }
 
     #[tokio::test]
@@ -2957,8 +3009,8 @@ mod tests {
     }
 
     fn valid_range(from: u64, to: u64) -> SignedBlobRange {
-        let bytes = b"blob";
-        let b3 = blake3::hash(bytes).to_hex().to_string();
+        let bytes = test_sidecar_bytes(from as u8);
+        let b3 = blake3::hash(&bytes).to_hex().to_string();
         SignedBlobRange {
             body: BlobRangeBody {
                 format: BLOB_RANGE_FORMAT.to_string(),
@@ -2971,8 +3023,9 @@ mod tests {
                     height: from,
                     block_hash: block_hash(from),
                     blobs: vec![BlobObjectRef {
+                        chain_blob_hash: sidecar_chain_blob_hash(&bytes).unwrap(),
                         hash: format!("blake3:{b3}"),
-                        sha256: hashing::sha256_bytes(bytes),
+                        sha256: hashing::sha256_bytes(&bytes),
                         size: bytes.len() as u64,
                         path: blob_object_path(&b3).unwrap(),
                     }],

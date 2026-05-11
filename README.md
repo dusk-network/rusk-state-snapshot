@@ -358,7 +358,11 @@ Rusk GraphQL node, downloads each sidecar through `/on/blobs:<hash>/hash`, and
 verifies the sidecar commitment derives the chain-reported versioned KZG blob
 hash and that the blob data verifies against the commitment/proof before
 writing the descriptor. `blobs-pack-range` repeats those descriptor/file/KZG
-checks before creating content-addressed blob objects.
+checks before creating content-addressed blob objects. Each blob range entry
+stores both the chain-reported versioned KZG blob hash and the content hashes,
+so later coverage verification can prove the full
+`block -> chain blob hash -> sidecar commitment/proof/data -> blob object`
+link without trusting the original pack step.
 
 ## Operational Flows
 
