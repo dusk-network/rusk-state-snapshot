@@ -5,6 +5,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(name = "rusk-state-snapshot")]
 #[command(about = "Standalone signed Rusk state snapshot distribution tool")]
+#[command(version)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
