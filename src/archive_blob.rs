@@ -1339,10 +1339,10 @@ async fn restore_state_snapshot_to_temp(
         .context("state manifest path has no parent")?;
     let artifact = &state_manifest.body.artifacts[0];
     let artifact_path = format!("{state_dir}/{}", artifact.path);
-    let archive_path = extract_dir.with_extension("tar.zst");
+    let archive_path = extract_dir.with_file_name(&artifact.path);
     store.get_to_file(&artifact_path, &archive_path).await?;
     verify_local_state_artifact(&archive_path, artifact)?;
-    safe_extract::extract_zstd_tar_safe(&archive_path, extract_dir)?;
+    safe_extract::extract_snapshot_tar_safe(&archive_path, extract_dir)?;
     let state_id = fs::read(extract_dir.join("state/state.id"))?;
     if hex::encode(state_id) != state_manifest.body.state_id {
         bail!("restored state.id does not match state manifest");
@@ -1362,10 +1362,10 @@ async fn restore_archive_snapshot_to_temp(
         .context("archive manifest path has no parent")?;
     let artifact = &archive.body.artifacts[0];
     let artifact_path = format!("{archive_dir}/{}", artifact.path);
-    let archive_path = extract_dir.with_extension("tar.zst");
+    let archive_path = extract_dir.with_file_name(&artifact.path);
     store.get_to_file(&artifact_path, &archive_path).await?;
     verify_local_archive_artifact(&archive_path, artifact)?;
-    safe_extract::extract_zstd_tar_safe(&archive_path, extract_dir)?;
+    safe_extract::extract_snapshot_tar_safe(&archive_path, extract_dir)?;
     if !extract_dir.join("archive").is_dir() {
         bail!("archive artifact did not contain archive/ directory");
     }

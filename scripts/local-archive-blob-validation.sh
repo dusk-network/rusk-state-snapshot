@@ -28,6 +28,9 @@ RESTORE_HTTP_ADDR="${RESTORE_HTTP_ADDR:-127.0.0.1:8091}"
 RESTORE_URL="${RESTORE_URL:-http://$RESTORE_HTTP_ADDR}"
 RESTORE_KADCAST_ADDR="${RESTORE_KADCAST_ADDR:-127.0.0.1:9111}"
 RESTORE_NETWORK_ID="${RESTORE_NETWORK_ID:-239}"
+WAIT_TIP_ATTEMPTS="${WAIT_TIP_ATTEMPTS:-120}"
+WAIT_TX_ATTEMPTS="${WAIT_TX_ATTEMPTS:-180}"
+WAIT_RESTORED_TIP_ATTEMPTS="${WAIT_RESTORED_TIP_ATTEMPTS:-$WAIT_TIP_ATTEMPTS}"
 RESTORED_NODE_PID=""
 
 cleanup() {
@@ -71,7 +74,7 @@ block_query() {
 wait_tip() {
   local target="$1"
   local current
-  for _ in $(seq 1 120); do
+  for _ in $(seq 1 "$WAIT_TIP_ATTEMPTS"); do
     current="$(tip_height)"
     if [[ "$current" =~ ^[0-9]+$ ]] && (( current >= target )); then
       return 0
@@ -137,7 +140,7 @@ wait_for_tx() {
   local tx_id="$1"
   local from="$2"
   local current height block_json found
-  for _ in $(seq 1 180); do
+  for _ in $(seq 1 "$WAIT_TX_ATTEMPTS"); do
     current="$(tip_height)"
     if [[ "$current" =~ ^[0-9]+$ ]] && (( current >= from )); then
       for height in $(seq "$from" "$current"); do
@@ -240,7 +243,7 @@ wait_remote_tip() {
   local url="$1"
   local target="$2"
   local current
-  for _ in $(seq 1 120); do
+  for _ in $(seq 1 "$WAIT_RESTORED_TIP_ATTEMPTS"); do
     current="$(graphql_at "$url" '{ block(height: -1) { header { height } } }' 2>/dev/null \
       | jq -r '.data.block.header.height // empty' || true)"
     if [[ "$current" =~ ^[0-9]+$ ]] && (( current >= target )); then
@@ -268,7 +271,7 @@ check_restored_node() {
     "$RUSK_BIN" \
       --log-type plain \
       --log-level info \
-      --db-path "$RESTORE_PROFILE" \
+      --db-path "$RESTORE_PROFILE/chain.db" \
       --http-listen-addr "$RESTORE_HTTP_ADDR" \
       --kadcast-public-address "$RESTORE_KADCAST_ADDR" \
       --network-id "$RESTORE_NETWORK_ID" \
@@ -457,7 +460,7 @@ cargo run --manifest-path "$ROOT/Cargo.toml" -- blobs-verify-coverage \
 
 echo "restoring state and archive artifacts from manifests"
 RESTORE_PROFILE="$WORKDIR/restored-profile"
-RESTORE_ARCHIVE="$RESTORE_PROFILE/archive"
+RESTORE_ARCHIVE="$RESTORE_PROFILE/chain.db/archive"
 rm -rf "$RESTORE_PROFILE" "$RESTORE_ARCHIVE"
 cargo run --manifest-path "$ROOT/Cargo.toml" -- archive-restore-complete \
   --config "$WORKDIR/config.toml" \

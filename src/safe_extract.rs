@@ -8,10 +8,6 @@ use std::{
 };
 use tar::{Archive, EntryType};
 
-pub fn extract_zstd_tar_safe(archive_path: &Path, destination: &Path) -> Result<()> {
-    extract_tar_safe(archive_path, destination, SnapshotCompression::Zstd)
-}
-
 pub fn extract_snapshot_tar_safe(archive_path: &Path, destination: &Path) -> Result<()> {
     let compression = SnapshotCompression::from_path(archive_path)?;
     extract_tar_safe(archive_path, destination, compression)
