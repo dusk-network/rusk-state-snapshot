@@ -297,14 +297,6 @@ pub fn verify_candidate_light(candidate: &PackedCandidate) -> Result<()> {
     {
         bail!("candidate dir basename must match snapshot_id");
     }
-    let expected_artifact = candidate.candidate_dir.join("snapshot.tar.zst");
-    if candidate.artifact_path_local != expected_artifact {
-        bail!(
-            "candidate artifact path {} does not match expected {}",
-            candidate.artifact_path_local.display(),
-            expected_artifact.display()
-        );
-    }
     let expected_manifest = candidate.candidate_dir.join("manifest.json");
     if candidate.manifest_path_local != expected_manifest {
         bail!(
@@ -337,16 +329,21 @@ pub fn verify_candidate_light(candidate: &PackedCandidate) -> Result<()> {
     let manifest: SignedManifest = serde_json::from_slice(&manifest_bytes)?;
     manifest.validate_schema()?;
     let artifact = &manifest.body.artifacts[0];
-    if artifact.path != "snapshot.tar.zst" {
-        bail!("manifest artifact path must be snapshot.tar.zst");
+    let expected_artifact = candidate.candidate_dir.join(&artifact.path);
+    if candidate.artifact_path_local != expected_artifact {
+        bail!(
+            "candidate artifact path {} does not match expected {}",
+            candidate.artifact_path_local.display(),
+            expected_artifact.display()
+        );
     }
     if candidate
         .artifact_path_local
         .file_name()
         .and_then(|s| s.to_str())
-        != Some("snapshot.tar.zst")
+        != Some(artifact.path.as_str())
     {
-        bail!("candidate artifact must be final snapshot.tar.zst path");
+        bail!("candidate artifact must match final manifest artifact path");
     }
     if candidate
         .manifest_path_local
@@ -356,14 +353,14 @@ pub fn verify_candidate_light(candidate: &PackedCandidate) -> Result<()> {
     {
         bail!("candidate manifest must be final manifest.json path");
     }
-    if candidate
-        .candidate_dir
-        .join("snapshot.tar.zst.tmp")
-        .exists()
-        || candidate.candidate_dir.join("manifest.json.tmp").exists()
-        || candidate.candidate_dir.join("candidate.json.tmp").exists()
-    {
-        bail!("candidate contains unfinished temp files");
+    for entry in fs::read_dir(&candidate.candidate_dir)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().ends_with(".tmp") {
+            bail!(
+                "candidate contains unfinished temp file {}",
+                entry.path().display()
+            );
+        }
     }
     if manifest.body.height != candidate.stopped_tip.height {
         bail!("manifest height does not match stopped tip");
@@ -505,8 +502,9 @@ fn pack_candidate_files(
     fs::create_dir_all(&candidate_dir)
         .with_context(|| format!("create {}", candidate_dir.display()))?;
 
-    let artifact_path = candidate_dir.join("snapshot.tar.zst");
-    let artifact_tmp = candidate_dir.join("snapshot.tar.zst.tmp");
+    let artifact_name = args.compression.artifact_path();
+    let artifact_path = candidate_dir.join(artifact_name);
+    let artifact_tmp = candidate_dir.join(format!("{artifact_name}.tmp"));
     let manifest_path = candidate_dir.join("manifest.json");
     let manifest_tmp = candidate_dir.join("manifest.json.tmp");
     let marker_path = candidate_dir.join("candidate.json");
@@ -522,7 +520,12 @@ fn pack_candidate_files(
     }
 
     let state_id = archive::read_state_id(&args.state_dir)?;
-    archive::create_snapshot_archive(&args.state_dir, &args.chain_db_dir, &artifact_tmp)?;
+    archive::create_snapshot_archive(
+        &args.state_dir,
+        &args.chain_db_dir,
+        &artifact_tmp,
+        args.compression,
+    )?;
     sync_file(&artifact_tmp)?;
     fs::rename(&artifact_tmp, &artifact_path).with_context(|| {
         format!(
@@ -558,7 +561,7 @@ fn pack_candidate_files(
         created_at: Utc::now(),
         artifacts: vec![Artifact {
             name: "state-chain".to_string(),
-            path: "snapshot.tar.zst".to_string(),
+            path: artifact_name.to_string(),
             size: hashes.size,
             sha256: hashes.sha256,
             blake3: hashes.blake3,
@@ -651,8 +654,12 @@ fn sync_dir(path: &Path) {
 fn read_archived_state_id(artifact_path: &Path) -> Result<String> {
     let file =
         File::open(artifact_path).with_context(|| format!("open {}", artifact_path.display()))?;
-    let decoder = zstd::Decoder::new(file)?;
-    let mut archive = tar::Archive::new(decoder);
+    let compression = archive::SnapshotCompression::from_path(artifact_path)?;
+    let reader: Box<dyn Read> = match compression {
+        archive::SnapshotCompression::Gzip => Box::new(flate2::read::GzDecoder::new(file)),
+        archive::SnapshotCompression::Zstd => Box::new(zstd::Decoder::new(file)?),
+    };
+    let mut archive = tar::Archive::new(reader);
     for entry in archive.entries()? {
         let mut entry = entry?;
         if entry.path()?.as_ref() == Path::new("state/state.id") {

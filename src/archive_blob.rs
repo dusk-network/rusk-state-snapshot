@@ -2820,7 +2820,12 @@ mod tests {
         fs::write(state_dir.join("state.id"), hex::decode(STATE_ID)?)?;
         fs::write(state_dir.join("state.txt"), b"state")?;
         fs::write(chain_dir.join("chain.txt"), b"chain")?;
-        archive::create_snapshot_archive(&state_dir, &chain_dir, &dir.join("snapshot.tar.zst"))?;
+        archive::create_snapshot_archive(
+            &state_dir,
+            &chain_dir,
+            &dir.join("snapshot.tar.zst"),
+            archive::SnapshotCompression::Zstd,
+        )?;
         let hashes = hashing::hash_file(&dir.join("snapshot.tar.zst"))?;
         let body = ManifestBody {
             format: MANIFEST_FORMAT.to_string(),

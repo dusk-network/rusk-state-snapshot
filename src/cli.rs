@@ -1,3 +1,4 @@
+use crate::archive::SnapshotCompression;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -80,6 +81,9 @@ pub struct PackArgs {
     pub key_id: Option<String>,
     #[arg(long)]
     pub publisher_name: Option<String>,
+    /// Snapshot artifact compression. Defaults to gzip (`snapshot.tar.gz`); use zstd for `snapshot.tar.zst`.
+    #[arg(long, value_enum, default_value_t = SnapshotCompression::Gzip)]
+    pub compression: SnapshotCompression,
 }
 
 #[derive(Debug, Args)]
@@ -255,6 +259,10 @@ pub struct WatchArgs {
     pub rusk_version: String,
     #[arg(long)]
     pub allow_prestop_tip: bool,
+    /// Snapshot artifact compression for captures created by this watcher.
+    /// Defaults to gzip (`snapshot.tar.gz`); use zstd for `snapshot.tar.zst`.
+    #[arg(long, value_enum, default_value_t = SnapshotCompression::Gzip)]
+    pub compression: SnapshotCompression,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -303,6 +311,9 @@ pub struct CaptureArgs {
     pub rusk_version: String,
     #[arg(long)]
     pub delete_candidate_after_publish: bool,
+    /// Snapshot artifact compression. Defaults to gzip (`snapshot.tar.gz`); use zstd for `snapshot.tar.zst`.
+    #[arg(long, value_enum, default_value_t = SnapshotCompression::Gzip)]
+    pub compression: SnapshotCompression,
 }
 
 #[derive(Debug, Args)]

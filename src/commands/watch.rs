@@ -428,6 +428,7 @@ fn capture_args_for_labels(
         max_capture_lag: args.max_capture_lag.clone(),
         rusk_version: args.rusk_version.clone(),
         delete_candidate_after_publish: true,
+        compression: args.compression,
     }
 }
 
@@ -460,6 +461,7 @@ fn capture_args_for_candidate(
         max_capture_lag: args.max_capture_lag.clone(),
         rusk_version: args.rusk_version.clone(),
         delete_candidate_after_publish: true,
+        compression: args.compression,
     }
 }
 

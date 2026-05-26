@@ -122,7 +122,7 @@ pub async fn verify_manifest_local(
     }
     safe_extract::validate_archive_safe(&archive_path)?;
     let tmp = tempfile::tempdir()?;
-    safe_extract::extract_zstd_tar_safe(&archive_path, tmp.path())?;
+    safe_extract::extract_snapshot_tar_safe(&archive_path, tmp.path())?;
     let state_id = fs::read(tmp.path().join("state/state.id"))?;
     if hex::encode(state_id) != manifest.body.state_id {
         bail!("archive state/state.id does not match manifest state_id");

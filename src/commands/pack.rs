@@ -17,8 +17,14 @@ pub async fn run(args: PackArgs) -> Result<()> {
     let id = snapshot_id(args.height, &args.state_root.to_lowercase());
     let candidate_dir = args.out.join(&id);
     fs::create_dir_all(&candidate_dir)?;
-    let archive_path = candidate_dir.join("snapshot.tar.zst");
-    archive::create_snapshot_archive(&args.state_dir, &args.chain_db_dir, &archive_path)?;
+    let artifact_name = args.compression.artifact_path();
+    let archive_path = candidate_dir.join(artifact_name);
+    archive::create_snapshot_archive(
+        &args.state_dir,
+        &args.chain_db_dir,
+        &archive_path,
+        args.compression,
+    )?;
     let hashes = hashing::hash_file(&archive_path)?;
 
     let key_id = args
@@ -43,7 +49,7 @@ pub async fn run(args: PackArgs) -> Result<()> {
         created_at: Utc::now(),
         artifacts: vec![Artifact {
             name: "state-chain".to_string(),
-            path: "snapshot.tar.zst".to_string(),
+            path: artifact_name.to_string(),
             size: hashes.size,
             sha256: hashes.sha256,
             blake3: hashes.blake3,

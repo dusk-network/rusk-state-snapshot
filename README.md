@@ -125,7 +125,7 @@ cargo run -- watch \
 ```
 
 `capture` stops Rusk only long enough to write a local immutable candidate and
-run light structural verification. Once `snapshot.tar.zst`, `manifest.json`,
+run light structural verification. Once `snapshot.tar.gz`, `manifest.json`,
 and `candidate.json` are complete in the spool directory, Rusk is started
 again. Full candidate verification, including artifact hashing and archive
 safety validation, happens after restart and reads only those candidate files,
@@ -165,7 +165,7 @@ The candidate spool layout is:
 <spool-dir>/
   candidates/
     h001234567-sr_abcd1234/
-      snapshot.tar.zst
+      snapshot.tar.gz
       manifest.json
       candidate.json
 ```
@@ -195,9 +195,12 @@ It excludes archive data, logs, wallets, consensus keys, node configuration
 secrets, object-store credentials, signing keys, and anything outside the
 explicit input roots.
 
-Archives are compressed tar files named `snapshot.tar.zst`; manifests record
-SHA-256 and BLAKE3 hashes. Archive extraction rejects absolute paths, `..`
-components, and symlinks that escape the extraction root.
+Archives are compressed tar files named `snapshot.tar.gz` by default; pass
+`--compression zstd` to `pack`, `capture`, or `watch` to produce
+`snapshot.tar.zst` instead. Manifests record the actual artifact path plus
+SHA-256 and BLAKE3 hashes, so restore and verification remain format-aware.
+Archive extraction rejects absolute paths, `..` components, and symlinks that
+escape the extraction root.
 
 ## Source vs Target
 
