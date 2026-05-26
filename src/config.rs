@@ -11,6 +11,20 @@ pub struct Config {
     pub source: HashMap<String, Endpoint>,
     #[serde(default)]
     pub target: HashMap<String, Endpoint>,
+    #[serde(default)]
+    pub archive_blob: ArchiveBlobConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ArchiveBlobConfig {
+    #[serde(default)]
+    pub require_signed_blob_ranges: bool,
+    #[serde(default)]
+    pub require_signed_blob_coverage: bool,
+    #[serde(default)]
+    pub require_signed_archive: bool,
+    #[serde(default)]
+    pub require_signed_archive_pointers: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

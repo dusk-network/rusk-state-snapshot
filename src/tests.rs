@@ -178,6 +178,7 @@ fn capture_fixture(
             max_capture_lag: "1h".to_string(),
             rusk_version: "test".to_string(),
             delete_candidate_after_publish: false,
+            compression: crate::archive::SnapshotCompression::Gzip,
         },
         target,
     )
@@ -323,6 +324,7 @@ async fn pack_candidate(tmp: &TempDir, signed: bool) -> std::path::PathBuf {
         signing_key: signed.then(|| SEED1.to_string()),
         key_id: Some("k1".to_string()),
         publisher_name: Some("Test".to_string()),
+        compression: crate::archive::SnapshotCompression::Gzip,
     })
     .await
     .unwrap();
@@ -373,7 +375,11 @@ async fn pack_creates_manifest_archive_and_validates_state_id() {
     let manifest_path = pack_candidate(&tmp, false).await;
     let manifest: SignedManifest =
         serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    let artifact_path = manifest_path.parent().unwrap().join("snapshot.tar.zst");
+    assert_eq!(manifest.body.artifacts[0].path, "snapshot.tar.gz");
+    let artifact_path = manifest_path
+        .parent()
+        .unwrap()
+        .join(&manifest.body.artifacts[0].path);
     let hashes = hashing::hash_file(&artifact_path).unwrap();
     assert_eq!(manifest.body.artifacts[0].sha256, hashes.sha256);
     assert_eq!(manifest.body.artifacts[0].blake3, hashes.blake3);
@@ -389,7 +395,7 @@ async fn pack_creates_manifest_archive_and_validates_state_id() {
     .unwrap();
 
     let extract = tempfile::tempdir().unwrap();
-    safe_extract::extract_zstd_tar_safe(&artifact_path, extract.path()).unwrap();
+    safe_extract::extract_snapshot_tar_safe(&artifact_path, extract.path()).unwrap();
     assert!(extract.path().join("chain.db/000001.log").exists());
     assert!(!extract.path().join("state/debug.log").exists());
 
@@ -399,6 +405,57 @@ async fn pack_creates_manifest_archive_and_validates_state_id() {
     assert!(archive::read_state_id(&bad.path().join("state")).is_err());
     fs::write(bad.path().join("state/state.id"), [1u8; 31]).unwrap();
     assert!(archive::read_state_id(&bad.path().join("state")).is_err());
+}
+
+#[tokio::test]
+async fn pack_can_still_write_zstd_when_requested() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("input-state");
+    let chain = tmp.path().join("input-chain.db");
+    make_profile(tmp.path());
+    fs::rename(tmp.path().join("state"), &state).unwrap();
+    fs::rename(tmp.path().join("chain.db"), &chain).unwrap();
+
+    commands::pack::run(PackArgs {
+        network: "mainnet".to_string(),
+        role: "provisioner".to_string(),
+        state_dir: state,
+        chain_db_dir: chain,
+        height: 1,
+        block_hash: HASH1.to_string(),
+        state_root: HASH2.to_string(),
+        block_timestamp: "2026-05-04T00:00:00Z".to_string(),
+        rusk_version: "1.6.0".to_string(),
+        out: tmp.path().join("candidates"),
+        signing_key: None,
+        key_id: None,
+        publisher_name: None,
+        compression: crate::archive::SnapshotCompression::Zstd,
+    })
+    .await
+    .unwrap();
+
+    let manifest_path = tmp
+        .path()
+        .join("candidates/h000000001-sr_22222222/manifest.json");
+    let manifest: SignedManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest.body.artifacts[0].path, "snapshot.tar.zst");
+    assert!(manifest_path
+        .parent()
+        .unwrap()
+        .join("snapshot.tar.zst")
+        .exists());
+    commands::verify::run(VerifyArgs {
+        manifest: manifest_path.to_string_lossy().to_string(),
+        config: None,
+        trusted_key: vec![],
+        require_signature: false,
+        network: Some("mainnet".to_string()),
+        role: Some("provisioner".to_string()),
+    })
+    .await
+    .unwrap();
 }
 
 #[test]
@@ -472,7 +529,7 @@ async fn local_object_store_and_publish_idempotency_conflict() {
         .join("target/v1/snapshots/full/h000000001-sr_22222222/manifest.json");
     let final_artifact = tmp
         .path()
-        .join("target/v1/snapshots/full/h000000001-sr_22222222/snapshot.tar.zst");
+        .join("target/v1/snapshots/full/h000000001-sr_22222222/snapshot.tar.gz");
     let manifest_mtime = fs::metadata(&final_manifest).unwrap().modified().unwrap();
     let artifact_mtime = fs::metadata(&final_artifact).unwrap().modified().unwrap();
     assert!(manifest_mtime >= artifact_mtime);
@@ -1335,7 +1392,7 @@ async fn multi_label_capture_publishes_one_artifact_and_three_pointers() {
     let artifact_file = target
         .join("v1/snapshots/full")
         .join(&candidate.snapshot_id)
-        .join("snapshot.tar.zst");
+        .join("snapshot.tar.gz");
     assert!(manifest_file.exists());
     assert!(artifact_file.exists());
 
@@ -1432,6 +1489,7 @@ async fn watch_imports_orphaned_spool_candidate_before_marking_missed() {
         genesis_time: None,
         rusk_version: "test".to_string(),
         allow_prestop_tip: false,
+        compression: crate::archive::SnapshotCompression::Gzip,
     };
 
     assert!(commands::watch::import_spooled_candidates(&watch_args, &mut journal, now).unwrap());
@@ -1957,9 +2015,7 @@ async fn rebuild_index_lists_all_v1_objects_and_excludes_self() {
         .collect();
     assert!(paths.contains(&"v1/pointers/latest.json".to_string()));
     assert!(paths.contains(&"v1/snapshots/full/h000000001-sr_22222222/manifest.json".to_string()));
-    assert!(
-        paths.contains(&"v1/snapshots/full/h000000001-sr_22222222/snapshot.tar.zst".to_string())
-    );
+    assert!(paths.contains(&"v1/snapshots/full/h000000001-sr_22222222/snapshot.tar.gz".to_string()));
     // The index never describes itself.
     assert!(!paths.contains(&"v1/index.json".to_string()));
     // Sizes are recorded.
@@ -2012,7 +2068,7 @@ async fn promote_requires_signed_manifest_and_artifact_existence() {
     .unwrap();
 
     // Tamper: shrink the artifact so its size no longer matches the manifest.
-    let artifact = target.join("v1/snapshots/full/h000000001-sr_22222222/snapshot.tar.zst");
+    let artifact = target.join("v1/snapshots/full/h000000001-sr_22222222/snapshot.tar.gz");
     fs::write(&artifact, b"truncated").unwrap();
     let err = commands::promote::run(PromoteArgs {
         target: "local".to_string(),
@@ -2160,7 +2216,8 @@ async fn remote_verify_streams_artifact_to_temp_file() {
     let candidate = pack_candidate(&tmp, false).await;
     let candidate_dir = candidate.parent().unwrap();
     let manifest_bytes = fs::read(&candidate).unwrap();
-    let artifact_bytes = fs::read(candidate_dir.join("snapshot.tar.zst")).unwrap();
+    let manifest: SignedManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+    let artifact_bytes = fs::read(candidate_dir.join(&manifest.body.artifacts[0].path)).unwrap();
 
     // Spin a tiny one-shot HTTP/1.1 server that serves manifest then archive.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

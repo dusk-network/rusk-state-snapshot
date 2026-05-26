@@ -27,7 +27,7 @@ pub async fn run(args: PublishArgs) -> Result<()> {
     }
     let id = snapshot_id(manifest.body.height, &manifest.body.state_root);
     let final_manifest = format!("v1/snapshots/full/{id}/manifest.json");
-    let final_artifact = format!("v1/snapshots/full/{id}/snapshot.tar.zst");
+    let final_artifact = format!("v1/snapshots/full/{id}/{}", artifact.path);
 
     // Upload the artifact directly to its final key so we never depend on
     // server-side single-PUT copies (limited to 5 GiB on S3-compatible

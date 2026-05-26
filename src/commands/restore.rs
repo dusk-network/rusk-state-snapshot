@@ -75,7 +75,7 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("."));
     fs::create_dir_all(&temp_parent)?;
     let temp = tempfile::tempdir_in(&temp_parent)?;
-    let archive_path = temp.path().join("snapshot.tar.zst");
+    let archive_path = temp.path().join(&artifact.path);
     store
         .get_to_file(&artifact_remote_path, &archive_path)
         .await?;
@@ -87,7 +87,7 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
         bail!("artifact hash/size mismatch");
     }
     let extract_dir = temp.path().join("extract");
-    safe_extract::extract_zstd_tar_safe(&archive_path, &extract_dir)?;
+    safe_extract::extract_snapshot_tar_safe(&archive_path, &extract_dir)?;
     let state_id = fs::read(extract_dir.join("state/state.id"))?;
     if hex::encode(state_id) != manifest.body.state_id {
         bail!("extracted state.id does not match manifest");

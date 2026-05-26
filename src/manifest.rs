@@ -1,4 +1,7 @@
-use crate::signing::{self, SignatureBlock, TrustKey};
+use crate::{
+    archive::SnapshotCompression,
+    signing::{self, SignatureBlock, TrustKey},
+};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -82,9 +85,7 @@ impl SignedManifest {
             bail!("manifest must contain exactly one artifact");
         }
         let artifact = &self.body.artifacts[0];
-        if artifact.path != "snapshot.tar.zst" {
-            bail!("unexpected artifact path {}", artifact.path);
-        }
+        SnapshotCompression::from_artifact_path(&artifact.path)?;
         require_hex("block_hash", &self.body.block_hash, 32)?;
         require_hex("state_root", &self.body.state_root, 32)?;
         require_hex("state_id", &self.body.state_id, 32)?;

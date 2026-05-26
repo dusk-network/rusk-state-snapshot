@@ -1,4 +1,6 @@
 use anyhow::{bail, Context, Result};
+use clap::ValueEnum;
+use flate2::{write::GzEncoder, Compression};
 use std::{
     fs::{self, File},
     path::{Path, PathBuf},
@@ -6,17 +8,65 @@ use std::{
 use tar::Builder;
 use walkdir::WalkDir;
 
-pub fn create_snapshot_archive(state_dir: &Path, chain_db_dir: &Path, out: &Path) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SnapshotCompression {
+    Gzip,
+    Zstd,
+}
+
+impl SnapshotCompression {
+    pub fn artifact_path(self) -> &'static str {
+        match self {
+            Self::Gzip => "snapshot.tar.gz",
+            Self::Zstd => "snapshot.tar.zst",
+        }
+    }
+
+    pub fn from_artifact_path(path: &str) -> Result<Self> {
+        match path {
+            "snapshot.tar.gz" | "archive.tar.gz" => Ok(Self::Gzip),
+            "snapshot.tar.zst" | "archive.tar.zst" => Ok(Self::Zstd),
+            other => bail!("unsupported archive artifact path {other}"),
+        }
+    }
+
+    pub fn from_path(path: &Path) -> Result<Self> {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("archive path has no valid UTF-8 filename"))?;
+        Self::from_artifact_path(name)
+    }
+}
+
+pub fn create_snapshot_archive(
+    state_dir: &Path,
+    chain_db_dir: &Path,
+    out: &Path,
+    compression: SnapshotCompression,
+) -> Result<()> {
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
     }
     let file = File::create(out).with_context(|| format!("create {}", out.display()))?;
-    let encoder = zstd::Encoder::new(file, 3)?;
-    let mut tar = Builder::new(encoder);
-    append_dir_stable(&mut tar, state_dir, "state")?;
-    append_dir_stable(&mut tar, chain_db_dir, "chain.db")?;
-    let encoder = tar.into_inner()?;
-    encoder.finish()?;
+    match compression {
+        SnapshotCompression::Gzip => {
+            let encoder = GzEncoder::new(file, Compression::default());
+            let mut tar = Builder::new(encoder);
+            append_dir_stable(&mut tar, state_dir, "state")?;
+            append_dir_stable(&mut tar, chain_db_dir, "chain.db")?;
+            let encoder = tar.into_inner()?;
+            encoder.finish()?;
+        }
+        SnapshotCompression::Zstd => {
+            let encoder = zstd::Encoder::new(file, 3)?;
+            let mut tar = Builder::new(encoder);
+            append_dir_stable(&mut tar, state_dir, "state")?;
+            append_dir_stable(&mut tar, chain_db_dir, "chain.db")?;
+            let encoder = tar.into_inner()?;
+            encoder.finish()?;
+        }
+    }
     Ok(())
 }
 

@@ -1,16 +1,31 @@
+use crate::archive::SnapshotCompression;
 use anyhow::{bail, Context, Result};
+use flate2::read::GzDecoder;
 use std::{
     fs::{self, File},
+    io::Read,
     path::{Component, Path, PathBuf},
 };
 use tar::{Archive, EntryType};
 
-pub fn extract_zstd_tar_safe(archive_path: &Path, destination: &Path) -> Result<()> {
+pub fn extract_snapshot_tar_safe(archive_path: &Path, destination: &Path) -> Result<()> {
+    let compression = SnapshotCompression::from_path(archive_path)?;
+    extract_tar_safe(archive_path, destination, compression)
+}
+
+pub fn extract_tar_safe(
+    archive_path: &Path,
+    destination: &Path,
+    compression: SnapshotCompression,
+) -> Result<()> {
     fs::create_dir_all(destination)?;
     let file =
         File::open(archive_path).with_context(|| format!("open {}", archive_path.display()))?;
-    let decoder = zstd::Decoder::new(file)?;
-    let mut archive = Archive::new(decoder);
+    let reader: Box<dyn Read> = match compression {
+        SnapshotCompression::Gzip => Box::new(GzDecoder::new(file)),
+        SnapshotCompression::Zstd => Box::new(zstd::Decoder::new(file)?),
+    };
+    let mut archive = Archive::new(reader);
 
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -49,7 +64,7 @@ pub fn extract_zstd_tar_safe(archive_path: &Path, destination: &Path) -> Result<
 
 pub fn validate_archive_safe(archive_path: &Path) -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    extract_zstd_tar_safe(archive_path, tmp.path())
+    extract_snapshot_tar_safe(archive_path, tmp.path())
 }
 
 pub fn validate_archive_path(path: &Path) -> Result<()> {
