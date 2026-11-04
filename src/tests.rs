@@ -369,6 +369,13 @@ fn pointer_signature_verifies_and_rejects_tamper() {
     assert!(tampered.verify_signature(&trust(SEED1)).is_err());
 }
 
+#[test]
+fn canonical_json_sorts_object_keys() {
+    let value = serde_json::json!({"b": 1, "a": {"z": 2, "y": 3}, "c": [3, 1]});
+    let out = signing::canonical_json(&value).unwrap();
+    assert_eq!(out, br#"{"a":{"y":3,"z":2},"b":1,"c":[3,1]}"#);
+}
+
 #[tokio::test]
 async fn pack_creates_manifest_archive_and_validates_state_id() {
     let tmp = tempfile::tempdir().unwrap();

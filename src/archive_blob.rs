@@ -1586,6 +1586,9 @@ fn verify_sidecar_kzg(bytes: &[u8]) -> Result<SidecarProof> {
         KzgBlob::from_bytes(&bytes[COMMITMENT_LEN + PROOF_LEN..]).context("parse KZG blob data")?;
     let commitment_bytes = Bytes48::new(commitment);
     let proof_bytes = Bytes48::new(proof);
+    // Uses the bundled Ethereum mainnet KZG trusted setup. This assumes Dusk
+    // blobs use the same EIP-4844 ceremony and G1/G2 setup; export verifies real
+    // chain sidecars against it, so a wrong setup would fail there immediately.
     let valid = ethereum_kzg_settings(0)
         .verify_blob_kzg_proof(&blob, &commitment_bytes, &proof_bytes)
         .context("verify blob KZG proof")?;
@@ -1642,6 +1645,11 @@ fn is_forbidden_archive_input(path: &Path) -> bool {
         || lower.contains("credential")
         || lower.contains("wallet")
         || lower.contains("signing")
+        || lower.contains("consensus")
+        || lower.contains(".keys")
+        || lower.ends_with("/keys")
+        || lower.starts_with("keys/")
+        || lower == "keys"
         || lower.ends_with(".log")
         || lower.starts_with("logs/")
         || lower.contains("/logs/")

@@ -16,8 +16,48 @@ pub struct TrustKey {
     pub public_key: String,
 }
 
+/// Serialize `value` to a canonical JSON byte string: object keys sorted, no
+/// insignificant whitespace. Signatures are computed over this form, so the
+/// result must be stable across runs and independent of struct field order or
+/// map backing (e.g. a future `HashMap` field would otherwise serialize in a
+/// nondeterministic order and break verification).
 pub fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    Ok(serde_json::to_vec(value)?)
+    let value = serde_json::to_value(value)?;
+    let mut out = Vec::new();
+    write_canonical(&value, &mut out)?;
+    Ok(out)
+}
+
+fn write_canonical(value: &serde_json::Value, out: &mut Vec<u8>) -> Result<()> {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            out.push(b'{');
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for (i, key) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                serde_json::to_writer(&mut *out, key)?;
+                out.push(b':');
+                write_canonical(&map[key], out)?;
+            }
+            out.push(b'}');
+        }
+        Value::Array(items) => {
+            out.push(b'[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                write_canonical(item, out)?;
+            }
+            out.push(b']');
+        }
+        scalar => serde_json::to_writer(&mut *out, scalar)?,
+    }
+    Ok(())
 }
 
 pub fn sign_body<T: Serialize>(body: &T, key_id: &str, key_spec: &str) -> Result<SignatureBlock> {
