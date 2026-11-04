@@ -95,6 +95,34 @@ fn trust(seed: &str) -> std::collections::HashMap<String, signing::TrustKey> {
     map
 }
 
+/// Write a valid signed pointer (referencing the manifest `pointer_body` names)
+/// to `path`, committing to `manifest_sha256` so gc's digest check passes.
+fn write_signed_pointer(path: &std::path::Path, manifest_sha256: &str) {
+    let mut body = pointer_body();
+    body.manifest_sha256 = manifest_sha256.to_string();
+    let pointer = SignedPointer {
+        signature: signing::sign_body(&body, "k1", SEED1).unwrap(),
+        body,
+    };
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, serde_json::to_vec_pretty(&pointer).unwrap()).unwrap();
+}
+
+/// Write the valid signed manifest that `pointer_body` references into `target`,
+/// returning its sha256 (over the exact stored bytes) for the pointer to commit.
+fn write_referenced_manifest(target: &std::path::Path) -> String {
+    let body = body();
+    let manifest = SignedManifest {
+        signature: Some(signing::sign_body(&body, "k1", SEED1).unwrap()),
+        body,
+    };
+    let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    let path = target.join("v1/snapshots/full/h000000001-sr_22222222/manifest.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    hashing::sha256_bytes(&bytes)
+}
+
 fn dt(input: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(input)
         .unwrap()
@@ -369,6 +397,20 @@ fn pointer_signature_verifies_and_rejects_tamper() {
     assert!(tampered.verify_signature(&trust(SEED1)).is_err());
 }
 
+#[test]
+fn signed_body_serializes_in_declaration_order() {
+    // The signed representation must stay in struct declaration order, not be
+    // re-sorted: changing the bytes would invalidate every already-signed v1
+    // manifest/pointer. This locks that (a re-sort would put "artifacts" first).
+    let bytes = signing::canonical_json(&body()).unwrap();
+    let s = std::str::from_utf8(&bytes).unwrap();
+    assert!(s.starts_with(r#"{"format":"#), "got: {s}");
+    let pos = |k: &str| s.find(k).unwrap();
+    assert!(pos("\"network\":") < pos("\"role\":"));
+    assert!(pos("\"role\":") < pos("\"height\":"));
+    assert!(pos("\"height\":") < pos("\"artifacts\":"));
+}
+
 #[tokio::test]
 async fn pack_creates_manifest_archive_and_validates_state_id() {
     let tmp = tempfile::tempdir().unwrap();
@@ -595,6 +637,7 @@ async fn restore_verifies_before_replacing_and_keeps_backup() {
         destination_profile: dest.clone(),
         manage_service: None,
         owner: None,
+        insecure: false,
     })
     .await
     .unwrap();
@@ -619,6 +662,7 @@ async fn restore_verifies_before_replacing_and_keeps_backup() {
         destination_profile: dest.clone(),
         manage_service: None,
         owner: None,
+        insecure: false,
     })
     .await
     .is_err());
@@ -756,20 +800,24 @@ async fn gc_prunes_calendar_pointers_before_reachability() {
         ),
     )
     .unwrap();
+    let msha = write_referenced_manifest(&target);
     for day in 1..=6 {
-        let path = target.join(format!("v1/calendar/daily/2026-05-0{day}.json"));
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, b"{}").unwrap();
+        write_signed_pointer(
+            &target.join(format!("v1/calendar/daily/2026-05-0{day}.json")),
+            &msha,
+        );
     }
     for month in 1..=13 {
-        let path = target.join(format!("v1/calendar/monthly/2026-{month:02}.json"));
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, b"{}").unwrap();
+        write_signed_pointer(
+            &target.join(format!("v1/calendar/monthly/2026-{month:02}.json")),
+            &msha,
+        );
     }
     for year in 2024..=2026 {
-        let path = target.join(format!("v1/calendar/yearly/{year}.json"));
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, b"{}").unwrap();
+        write_signed_pointer(
+            &target.join(format!("v1/calendar/yearly/{year}.json")),
+            &msha,
+        );
     }
     let policy = tmp.path().join("retention.toml");
     fs::write(
@@ -792,6 +840,205 @@ async fn gc_prunes_calendar_pointers_before_reachability() {
     assert!(target.join("v1/calendar/monthly/2026-13.json").exists());
     assert!(!target.join("v1/calendar/yearly/2024.json").exists());
     assert!(target.join("v1/calendar/yearly/2026.json").exists());
+}
+
+#[tokio::test]
+async fn gc_fails_closed_when_a_reachable_manifest_is_unreadable() {
+    // A valid pointer references a manifest that is missing from the store.
+    // GC must abort rather than treat the pointer's snapshot as unreachable and
+    // delete a real (but here unrelated) artifact.
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("target");
+    let cfg = tmp.path().join("config.toml");
+    fs::write(
+        &cfg,
+        format!(
+            "[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\nsigning_key_id='target-k1'\n",
+            target.display(),
+            SEED1
+        ),
+    )
+    .unwrap();
+
+    // Valid latest pointer -> manifest that we never write.
+    let body = pointer_body();
+    let pointer = SignedPointer {
+        signature: signing::sign_body(&body, "k1", SEED1).unwrap(),
+        body,
+    };
+    let ptr_path = target.join("v1/pointers/latest.json");
+    fs::create_dir_all(ptr_path.parent().unwrap()).unwrap();
+    fs::write(&ptr_path, serde_json::to_vec_pretty(&pointer).unwrap()).unwrap();
+
+    // An unrelated, unreferenced, old-enough artifact that a buggy GC would
+    // delete after silently under-marking the pointer above.
+    let orphan = target.join("v1/snapshots/full/h000000002-sr_33333333/snapshot.tar.gz");
+    fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    fs::write(&orphan, b"artifact").unwrap();
+
+    // A prunable daily pointer: with keep_daily=0 retention would delete it, but
+    // because deletion is deferred until marking succeeds, an aborted run must
+    // leave it intact.
+    let prunable = target.join("v1/calendar/daily/2026-05-01.json");
+    write_signed_pointer(&prunable, ""); // pruned, so never read/marked
+
+    let policy = tmp.path().join("retention.toml");
+    fs::write(
+        &policy,
+        "[rolling]\nkeep_latest=true\nkeep_previous=true\nkeep_daily=0\n[monthly]\nkeep_months=12\nselection='last-good-daily-of-month'\n[yearly]\nkeep_years=1\nselection='december-monthly'\n[gc]\ndelete_grace_period='0s'\ndry_run_default=true\n",
+    )
+    .unwrap();
+
+    let result = commands::gc::run(GcArgs {
+        target: "local".to_string(),
+        config: cfg,
+        policy,
+        dry_run: false,
+        delete: true,
+    })
+    .await;
+    assert!(
+        result.is_err(),
+        "gc should fail closed on an unreadable manifest"
+    );
+    assert!(
+        orphan.exists(),
+        "gc must not delete anything when it aborts"
+    );
+    assert!(
+        prunable.exists(),
+        "a failed mark phase must not have deleted the prunable pointer"
+    );
+}
+
+#[tokio::test]
+async fn gc_aborts_on_a_schema_invalid_reachable_manifest() {
+    // A reachable manifest tampered to have no artifacts parses but fails schema
+    // validation; GC must abort rather than mark nothing and sweep the snapshot.
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("target");
+    let cfg = tmp.path().join("config.toml");
+    fs::write(
+        &cfg,
+        format!(
+            "[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\nsigning_key_id='target-k1'\n",
+            target.display(),
+            SEED1
+        ),
+    )
+    .unwrap();
+    // Manifest with an empty artifact list (schema-invalid).
+    let mut mbody = body();
+    mbody.artifacts.clear();
+    let manifest = SignedManifest {
+        signature: Some(signing::sign_body(&mbody, "k1", SEED1).unwrap()),
+        body: mbody,
+    };
+    let mbytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    let mpath = target.join("v1/snapshots/full/h000000001-sr_22222222/manifest.json");
+    fs::create_dir_all(mpath.parent().unwrap()).unwrap();
+    fs::write(&mpath, &mbytes).unwrap();
+    // Pointer commits to the (invalid) manifest's digest so gc passes the digest
+    // check and reaches schema validation.
+    write_signed_pointer(
+        &target.join("v1/pointers/latest.json"),
+        &hashing::sha256_bytes(&mbytes),
+    );
+    let policy = tmp.path().join("retention.toml");
+    fs::write(
+        &policy,
+        "[rolling]\nkeep_latest=true\nkeep_previous=true\nkeep_daily=5\n[monthly]\nkeep_months=12\nselection='last-good-daily-of-month'\n[yearly]\nkeep_years=1\nselection='december-monthly'\n[gc]\ndelete_grace_period='0s'\ndry_run_default=true\n",
+    )
+    .unwrap();
+    let result = commands::gc::run(GcArgs {
+        target: "local".to_string(),
+        config: cfg,
+        policy,
+        dry_run: false,
+        delete: true,
+    })
+    .await;
+    assert!(
+        result.is_err(),
+        "gc should abort on a schema-invalid manifest"
+    );
+}
+
+#[test]
+fn ipv6_loopback_host_is_recognized() {
+    use crate::object_store::is_loopback_host;
+    assert!(is_loopback_host("[::1]"));
+    assert!(is_loopback_host("::1"));
+    assert!(is_loopback_host("127.0.0.1"));
+    assert!(is_loopback_host("localhost"));
+    assert!(!is_loopback_host("example.com"));
+    assert!(!is_loopback_host("[2001:db8::1]"));
+}
+
+#[tokio::test]
+async fn restore_refuses_remote_source_without_trusted_keys() {
+    // A remote (https) source with no trusted_keys must be refused before any
+    // state is touched, unless --insecure is passed.
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tmp.path().join("config.toml");
+    fs::write(
+        &cfg,
+        "[source.remote]\nkind='https'\nbase_url='https://example.invalid'\n",
+    )
+    .unwrap();
+    let err = commands::restore::run(RestoreArgs {
+        source: "remote".to_string(),
+        config: cfg,
+        latest: true,
+        monthly: None,
+        daily: None,
+        yearly: None,
+        pin: None,
+        manifest_path: None,
+        destination_profile: tmp.path().join("dest"),
+        manage_service: None,
+        owner: None,
+        insecure: false,
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("trusted_keys"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn restore_insecure_bypasses_the_remote_trust_gate() {
+    // With --insecure, the remote trust gate must not fire; restore proceeds
+    // (and here fails later on the unreachable host, not on trusted_keys).
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tmp.path().join("config.toml");
+    fs::write(
+        &cfg,
+        "[source.remote]\nkind='https'\nbase_url='https://nonexistent.invalid'\n",
+    )
+    .unwrap();
+    let err = commands::restore::run(RestoreArgs {
+        source: "remote".to_string(),
+        config: cfg,
+        latest: true,
+        monthly: None,
+        daily: None,
+        yearly: None,
+        pin: None,
+        manifest_path: None,
+        destination_profile: tmp.path().join("dest"),
+        manage_service: None,
+        owner: None,
+        insecure: true,
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        !err.to_string().contains("trusted_keys"),
+        "insecure should bypass the trust gate, got: {err}"
+    );
 }
 
 #[test]
@@ -1903,11 +2150,16 @@ async fn gc_dry_run_excludes_simulated_pruned_pointers_from_reachability() {
     })
     .await
     .unwrap();
-    // Create extra daily calendar pointers older than what retention keeps.
+    // Create extra daily calendar pointers older than what retention keeps,
+    // each committing to the published manifest's digest.
+    let msha = hashing::sha256_bytes(
+        &fs::read(target.join("v1/snapshots/full/h000000001-sr_22222222/manifest.json")).unwrap(),
+    );
     for day in 1..=4 {
-        let path = target.join(format!("v1/calendar/daily/2026-05-0{day}.json"));
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, b"{}").unwrap();
+        write_signed_pointer(
+            &target.join(format!("v1/calendar/daily/2026-05-0{day}.json")),
+            &msha,
+        );
     }
     // Policy keeps only 2 dailies: the older 2 should appear as prunable.
     let policy = tmp.path().join("retention.toml");

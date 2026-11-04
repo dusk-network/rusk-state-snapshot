@@ -1,8 +1,8 @@
 use crate::{
-    archive_blob, cli::GcArgs, config::Config, manifest::SignedManifest, object_store,
+    archive_blob, cli::GcArgs, config::Config, hashing, manifest::SignedManifest, object_store,
     pointer::SignedPointer, retention::RetentionPolicy,
 };
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
@@ -27,16 +27,11 @@ pub async fn run(args: GcArgs) -> Result<()> {
     // a dry run regardless of whether --dry-run was passed.
     let dry_run = !args.delete;
 
-    // Compute the set of pointers that retention would prune. On a real run
-    // we delete them up-front. On a dry run we DON'T delete, but we still
-    // exclude them from reachability marking so the report accurately
-    // reflects what `--delete` would later remove.
+    // Compute (but do NOT yet delete) the pointers retention would prune, and
+    // exclude them from reachability marking so the report reflects what a real
+    // run would remove. Nothing is deleted until marking and sweep planning
+    // fully succeed, so an abort mid-marking leaves the store untouched.
     let prunable_pointers = simulate_prune_pointers(store.as_ref(), &policy).await?;
-    if !dry_run {
-        for path in &prunable_pointers {
-            store.delete(path).await?;
-        }
-    }
     let pruned: HashSet<&str> = prunable_pointers.iter().map(|s| s.as_str()).collect();
 
     let mut marked = HashSet::new();
@@ -58,18 +53,63 @@ pub async fn run(args: GcArgs) -> Result<()> {
                 continue;
             }
             marked.insert(meta.path.clone());
-            let bytes = store.get(&meta.path).await?;
-            if let Ok(pointer) = serde_json::from_slice::<SignedPointer>(&bytes) {
-                marked.insert(pointer.body.manifest_path.clone());
-                if let Ok(manifest_bytes) = store.get(&pointer.body.manifest_path).await {
-                    if let Ok(manifest) = serde_json::from_slice::<SignedManifest>(&manifest_bytes)
-                    {
-                        if let Some((dir, _)) = pointer.body.manifest_path.rsplit_once('/') {
-                            for artifact in manifest.body.artifacts {
-                                marked.insert(format!("{dir}/{}", artifact.path));
-                            }
-                        }
-                    }
+            // Fail closed: a read OR parse error on a listed pointer aborts GC
+            // rather than silently under-marking. A corrupt-but-real pointer
+            // would otherwise be skipped, leaving its snapshot deletable. (All
+            // pointers the tool writes are valid JSON; there is no opaque-marker
+            // format under these prefixes.)
+            let bytes = store
+                .get(&meta.path)
+                .await
+                .with_context(|| format!("gc: read pointer {}", meta.path))?;
+            let pointer: SignedPointer = serde_json::from_slice(&bytes).with_context(|| {
+                format!(
+                    "gc: parse pointer {}; refusing to GC with an unreadable pointer",
+                    meta.path
+                )
+            })?;
+            // Validate the pointer (constrains its manifest_path) before trusting
+            // the reference it hands us.
+            pointer
+                .validate_schema()
+                .with_context(|| format!("gc: invalid pointer {}", meta.path))?;
+            marked.insert(pointer.body.manifest_path.clone());
+            // From here fail closed: a valid pointer's manifest MUST resolve. A
+            // transient read error or a corrupt manifest would otherwise leave a
+            // live snapshot's artifacts unmarked and deletable under `--delete`.
+            let manifest_bytes =
+                store
+                    .get(&pointer.body.manifest_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "gc: read manifest {} referenced by pointer {}",
+                            pointer.body.manifest_path, meta.path
+                        )
+                    })?;
+            // Bind the manifest to the pointer: its bytes must match the digest
+            // the pointer committed to, or a substituted manifest could redirect
+            // reachability.
+            let digest = hashing::sha256_bytes(&manifest_bytes);
+            if digest != pointer.body.manifest_sha256 {
+                bail!(
+                    "gc: manifest {} digest {digest} does not match pointer {} ({})",
+                    pointer.body.manifest_path,
+                    meta.path,
+                    pointer.body.manifest_sha256
+                );
+            }
+            let manifest: SignedManifest = serde_json::from_slice(&manifest_bytes)
+                .with_context(|| format!("gc: parse manifest {}", pointer.body.manifest_path))?;
+            // Validate the schema before trusting its artifact list: a manifest
+            // tampered to `artifacts: []` would otherwise mark nothing and leave
+            // its real artifact deletable.
+            manifest
+                .validate_schema()
+                .with_context(|| format!("gc: invalid manifest {}", pointer.body.manifest_path))?;
+            if let Some((dir, _)) = pointer.body.manifest_path.rsplit_once('/') {
+                for artifact in manifest.body.artifacts {
+                    marked.insert(format!("{dir}/{}", artifact.path));
                 }
             }
         }
@@ -83,6 +123,9 @@ pub async fn run(args: GcArgs) -> Result<()> {
             if marked.contains(&meta.path) {
                 continue;
             }
+            // Retain when the modified time is unknown: deleting an object we
+            // cannot age-check could remove something still within its grace
+            // period. Better to keep (possible garbage) than risk data loss.
             let old_enough = meta
                 .modified
                 .and_then(|m| {
@@ -90,7 +133,7 @@ pub async fn run(args: GcArgs) -> Result<()> {
                     now.duration_since(st).ok()
                 })
                 .map(|age| age >= grace)
-                .unwrap_or(true);
+                .unwrap_or(false);
             if old_enough {
                 deletable.push(meta.path);
             }
@@ -99,6 +142,12 @@ pub async fn run(args: GcArgs) -> Result<()> {
     deletable.sort();
     let mut deleted = Vec::new();
     if !dry_run {
+        // Only now, after marking and sweep planning have succeeded, do we
+        // mutate the store: prune the retention pointers, then delete the
+        // unreferenced objects.
+        for path in &prunable_pointers {
+            store.delete(path).await?;
+        }
         for path in &deletable {
             store.delete(path).await?;
             deleted.push(path.clone());

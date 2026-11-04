@@ -163,6 +163,11 @@ pub struct RestoreArgs {
     pub manage_service: Option<String>,
     #[arg(long)]
     pub owner: Option<String>,
+    /// Allow restoring from a remote source without a verified signature from a
+    /// trusted key. Required to overwrite node state from an unsigned or
+    /// untrusted remote snapshot; local file sources never need it.
+    #[arg(long)]
+    pub insecure: bool,
 }
 
 #[derive(Debug, Args)]
@@ -484,4 +489,8 @@ pub struct ArchiveRestoreCompleteArgs {
     /// Replace existing restored state/archive directories.
     #[arg(long)]
     pub replace: bool,
+    /// Allow restoring from a remote source without verified signatures from
+    /// trusted keys. Local file sources never need it.
+    #[arg(long)]
+    pub insecure: bool,
 }

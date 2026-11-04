@@ -12,7 +12,7 @@ use crate::{
     config::Config,
     object_store,
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 pub async fn blobs_export_range(args: BlobsExportRangeArgs) -> Result<()> {
     let path = archive_blob::export_blob_range(ExportBlobRangeOptions {
@@ -179,7 +179,30 @@ pub async fn archive_restore_complete(args: ArchiveRestoreCompleteArgs) -> Resul
     let cfg = Config::load(&args.config)?;
     let source = cfg.source(&args.source)?;
     let trust = cfg.trusted_for_endpoint(source)?;
-    let verify = ArchiveBlobVerifyOptions::from(&cfg.archive_blob);
+    let mut verify = ArchiveBlobVerifyOptions::from(&cfg.archive_blob);
+    // Archive restore overwrites node state, so fail closed for remote sources:
+    // require trusted signatures on the archive, blob ranges, coverage, and
+    // pointers unless the operator passes --insecure.
+    if args.insecure {
+        // Clean bypass of signature trust; schema/hash/completeness/KZG still run.
+        verify.insecure = true;
+        verify.require_signed_blob_ranges = false;
+        verify.require_signed_blob_coverage = false;
+        verify.require_signed_archive = false;
+        verify.require_signed_archive_pointers = false;
+    } else if !source.is_local() {
+        if trust.is_empty() {
+            bail!(
+                "restoring an archive from remote source `{}` requires at least one \
+                 trusted_keys entry in the config; configure one or pass --insecure",
+                args.source
+            );
+        }
+        verify.require_signed_blob_ranges = true;
+        verify.require_signed_blob_coverage = true;
+        verify.require_signed_archive = true;
+        verify.require_signed_archive_pointers = true;
+    }
     let store = object_store::from_endpoint(source)?;
     let proof = archive_blob::restore_archive_complete_with_options(
         store.as_ref(),

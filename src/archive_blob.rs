@@ -269,6 +269,9 @@ pub struct ArchiveBlobVerifyOptions {
     pub require_signed_blob_coverage: bool,
     pub require_signed_archive: bool,
     pub require_signed_archive_pointers: bool,
+    /// Bypass all signature trust checks (the `--insecure` escape hatch).
+    /// Schema, hash, completeness, and KZG proof validation still run.
+    pub insecure: bool,
 }
 
 impl From<&ArchiveBlobConfig> for ArchiveBlobVerifyOptions {
@@ -278,6 +281,7 @@ impl From<&ArchiveBlobConfig> for ArchiveBlobVerifyOptions {
             require_signed_blob_coverage: config.require_signed_blob_coverage,
             require_signed_archive: config.require_signed_archive,
             require_signed_archive_pointers: config.require_signed_archive_pointers,
+            insecure: false,
         }
     }
 }
@@ -1027,7 +1031,7 @@ pub async fn promote_archive_manifest_with_options(
     if verify.require_signed_archive {
         require_present_signature(&archive.signature, "archive manifest")?;
         archive.verify_signature(trust)?;
-    } else if archive.signature.is_some() || !trust.is_empty() {
+    } else if !verify.insecure && (archive.signature.is_some() || !trust.is_empty()) {
         archive.verify_signature(trust)?;
     }
     let manifest_sha256 = hashing::sha256_bytes(&bytes);
@@ -1119,7 +1123,9 @@ pub async fn verify_blob_coverage_with_options(
     if verify.require_signed_blob_coverage {
         require_present_signature(&coverage.signature, "blob coverage")?;
     }
-    coverage.verify_signature(trust)?;
+    if !verify.insecure {
+        coverage.verify_signature(trust)?;
+    }
     if coverage.body.from_height != from_height {
         bail!(
             "coverage starts at {}, expected {from_height}",
@@ -1154,13 +1160,13 @@ pub async fn verify_archive_complete(
     .await
 }
 
-pub async fn verify_archive_complete_with_options(
+async fn verify_archive_complete_inner(
     store: &dyn ObjectStore,
     archive_manifest_path: &str,
     target_height: u64,
     trust: &HashMap<String, TrustKey>,
     verify: ArchiveBlobVerifyOptions,
-) -> Result<ArchiveCompleteness> {
+) -> Result<VerifiedArchive> {
     validate_object_path(archive_manifest_path)?;
     let archive_bytes = store.get(archive_manifest_path).await?;
     let archive: SignedArchiveManifest = serde_json::from_slice(&archive_bytes)?;
@@ -1168,7 +1174,9 @@ pub async fn verify_archive_complete_with_options(
     if verify.require_signed_archive {
         require_present_signature(&archive.signature, "archive manifest")?;
     }
-    archive.verify_signature(trust)?;
+    if !verify.insecure {
+        archive.verify_signature(trust)?;
+    }
     let archive_dir = archive_manifest_path
         .rsplit_once('/')
         .map(|(dir, _)| dir)
@@ -1213,7 +1221,9 @@ pub async fn verify_archive_complete_with_options(
     if verify.require_signed_blob_coverage {
         require_present_signature(&coverage.signature, "blob coverage")?;
     }
-    coverage.verify_signature(trust)?;
+    if !verify.insecure {
+        coverage.verify_signature(trust)?;
+    }
     if coverage.body.network != archive.body.network {
         bail!("blob coverage network does not match archive network");
     }
@@ -1230,14 +1240,42 @@ pub async fn verify_archive_complete_with_options(
     if proof.block_hashes.get(&archive.body.height) != Some(&archive.body.block_hash) {
         bail!("blob coverage block hash at archive height does not match archive checkpoint");
     }
-    Ok(ArchiveCompleteness {
+    let completeness = ArchiveCompleteness {
         archive_manifest_path: archive_manifest_path.to_string(),
         archive_height: archive.body.height,
         target_height,
-        state_manifest_path: archive.body.state_snapshot.manifest_path,
-        blob_coverage_path: archive.body.blob_coverage.coverage_manifest_path,
+        state_manifest_path: archive.body.state_snapshot.manifest_path.clone(),
+        blob_coverage_path: archive.body.blob_coverage.coverage_manifest_path.clone(),
         blob_objects: proof.blob_objects,
+    };
+    Ok(VerifiedArchive {
+        completeness,
+        archive,
+        state_manifest,
     })
+}
+
+/// A fully verified archive checkpoint plus the authenticated manifests behind
+/// it, so restore installs from the already-verified bytes instead of
+/// re-fetching (which a remote could substitute).
+struct VerifiedArchive {
+    completeness: ArchiveCompleteness,
+    archive: SignedArchiveManifest,
+    state_manifest: SignedManifest,
+}
+
+pub async fn verify_archive_complete_with_options(
+    store: &dyn ObjectStore,
+    archive_manifest_path: &str,
+    target_height: u64,
+    trust: &HashMap<String, TrustKey>,
+    verify: ArchiveBlobVerifyOptions,
+) -> Result<ArchiveCompleteness> {
+    Ok(
+        verify_archive_complete_inner(store, archive_manifest_path, target_height, trust, verify)
+            .await?
+            .completeness,
+    )
 }
 
 #[allow(dead_code)]
@@ -1269,7 +1307,13 @@ pub async fn restore_archive_complete_with_options(
     store: &dyn ObjectStore,
     opts: RestoreArchiveOptions<'_>,
 ) -> Result<ArchiveRestoreProof> {
-    let completeness = verify_archive_complete_with_options(
+    // Install from the manifests verify authenticated, not a fresh fetch a
+    // remote could substitute between verification and installation.
+    let VerifiedArchive {
+        completeness,
+        archive,
+        state_manifest,
+    } = verify_archive_complete_inner(
         store,
         opts.archive_manifest_path,
         opts.target_height,
@@ -1277,12 +1321,6 @@ pub async fn restore_archive_complete_with_options(
         opts.verify,
     )
     .await?;
-    let archive_bytes = store.get(opts.archive_manifest_path).await?;
-    let archive: SignedArchiveManifest = serde_json::from_slice(&archive_bytes)?;
-    let state_bytes = store
-        .get(&archive.body.state_snapshot.manifest_path)
-        .await?;
-    let state_manifest: SignedManifest = serde_json::from_slice(&state_bytes)?;
 
     let temp_parent = opts
         .destination_profile
@@ -1382,15 +1420,17 @@ pub async fn mark_archive_blob_reachable(
                 continue;
             }
             marked.insert(meta.path.clone());
-            let Ok(bytes) = store.get(&meta.path).await else {
-                continue;
-            };
-            let Ok(pointer) = serde_json::from_slice::<SignedArchivePointer>(&bytes) else {
-                continue;
-            };
-            if pointer.validate_schema().is_err() {
-                continue;
-            }
+            // Fail closed: a read, parse, or schema error on a listed rooted
+            // pointer aborts GC rather than silently under-marking.
+            let bytes = store
+                .get(&meta.path)
+                .await
+                .with_context(|| format!("gc: read archive pointer {}", meta.path))?;
+            let pointer: SignedArchivePointer = serde_json::from_slice(&bytes)
+                .with_context(|| format!("gc: parse archive pointer {}", meta.path))?;
+            pointer
+                .validate_schema()
+                .with_context(|| format!("gc: invalid archive pointer {}", meta.path))?;
             mark_archive_manifest_reachable(store, marked, &pointer.body.manifest_path).await?;
         }
     }
@@ -1403,28 +1443,54 @@ async fn mark_archive_manifest_reachable(
     manifest_path: &str,
 ) -> Result<()> {
     marked.insert(manifest_path.to_string());
-    let Ok(bytes) = store.get(manifest_path).await else {
-        return Ok(());
-    };
-    let Ok(archive) = serde_json::from_slice::<SignedArchiveManifest>(&bytes) else {
-        return Ok(());
-    };
+    // Fail closed: a rooted archive manifest that cannot be read or parsed must
+    // abort GC, not silently leave its (and its state snapshot's) artifacts
+    // unmarked and therefore deletable.
+    let bytes = store
+        .get(manifest_path)
+        .await
+        .with_context(|| format!("gc: read archive manifest {manifest_path}"))?;
+    let archive: SignedArchiveManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("gc: parse archive manifest {manifest_path}"))?;
+    archive
+        .validate_schema()
+        .with_context(|| format!("gc: invalid archive manifest {manifest_path}"))?;
     let Some((archive_dir, _)) = manifest_path.rsplit_once('/') else {
-        return Ok(());
+        bail!("gc: archive manifest path has no parent directory: {manifest_path}");
     };
     for artifact in &archive.body.artifacts {
         marked.insert(format!("{archive_dir}/{}", artifact.path));
     }
     marked.insert(archive.body.state_snapshot.manifest_path.clone());
-    if let Ok(state_bytes) = store.get(&archive.body.state_snapshot.manifest_path).await {
-        if let Ok(state) = serde_json::from_slice::<SignedManifest>(&state_bytes) {
-            if let Some((state_dir, _)) = archive.body.state_snapshot.manifest_path.rsplit_once('/')
-            {
-                for artifact in state.body.artifacts {
-                    marked.insert(format!("{state_dir}/{}", artifact.path));
-                }
-            }
-        }
+    let state_bytes = store
+        .get(&archive.body.state_snapshot.manifest_path)
+        .await
+        .with_context(|| {
+            format!(
+                "gc: read state manifest {} referenced by archive {manifest_path}",
+                archive.body.state_snapshot.manifest_path
+            )
+        })?;
+    let state: SignedManifest = serde_json::from_slice(&state_bytes).with_context(|| {
+        format!(
+            "gc: parse state manifest {}",
+            archive.body.state_snapshot.manifest_path
+        )
+    })?;
+    state.validate_schema().with_context(|| {
+        format!(
+            "gc: invalid state manifest {}",
+            archive.body.state_snapshot.manifest_path
+        )
+    })?;
+    let Some((state_dir, _)) = archive.body.state_snapshot.manifest_path.rsplit_once('/') else {
+        bail!(
+            "gc: state manifest path has no parent directory: {}",
+            archive.body.state_snapshot.manifest_path
+        );
+    };
+    for artifact in state.body.artifacts {
+        marked.insert(format!("{state_dir}/{}", artifact.path));
     }
     Ok(())
 }
@@ -1568,6 +1634,9 @@ fn verify_sidecar_kzg(bytes: &[u8]) -> Result<SidecarProof> {
         KzgBlob::from_bytes(&bytes[COMMITMENT_LEN + PROOF_LEN..]).context("parse KZG blob data")?;
     let commitment_bytes = Bytes48::new(commitment);
     let proof_bytes = Bytes48::new(proof);
+    // Uses the bundled Ethereum mainnet KZG trusted setup. This assumes Dusk
+    // blobs use the same EIP-4844 ceremony and G1/G2 setup; export verifies real
+    // chain sidecars against it, so a wrong setup would fail there immediately.
     let valid = ethereum_kzg_settings(0)
         .verify_blob_kzg_proof(&blob, &commitment_bytes, &proof_bytes)
         .context("verify blob KZG proof")?;
@@ -1624,6 +1693,14 @@ fn is_forbidden_archive_input(path: &Path) -> bool {
         || lower.contains("credential")
         || lower.contains("wallet")
         || lower.contains("signing")
+        || lower.contains("consensus")
+        || lower.contains(".keys")
+        // Any `keys` path component (archive creation filters entries
+        // individually, so excluding the dir does not exclude its children).
+        || lower.contains("/keys/")
+        || lower.ends_with("/keys")
+        || lower.starts_with("keys/")
+        || lower == "keys"
         || lower.ends_with(".log")
         || lower.starts_with("logs/")
         || lower.contains("/logs/")

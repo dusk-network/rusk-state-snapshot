@@ -16,6 +16,18 @@ pub struct TrustKey {
     pub public_key: String,
 }
 
+/// Serialize `value` to the byte string signatures are computed over.
+///
+/// This is `serde_json`'s default serialization, which is deterministic for the
+/// signed bodies because they are composed only of scalars and ordered `Vec`s
+/// (serde emits struct fields in declaration order). It is deliberately NOT a
+/// re-sorting canonicalizer: changing the byte representation would invalidate
+/// every already-signed v1 manifest and pointer without a format version bump.
+///
+/// Invariant: signed bodies must not contain a `HashMap`/`BTreeMap` or
+/// `#[serde(flatten)]`ed map, whose serialization order is not guaranteed. The
+/// current bodies satisfy this; `signed_body_serializes_in_declaration_order`
+/// guards the representation against an accidental re-sort or reorder.
 pub fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(value)?)
 }
@@ -49,7 +61,6 @@ pub fn verify_body<T: Serialize>(
         .map_err(|_| anyhow!("signature verification failed"))
 }
 
-#[allow(dead_code)]
 pub fn public_key_from_secret_spec(key_spec: &str) -> Result<String> {
     let key_hex = resolve_secret_spec(key_spec)?;
     let sk = secret_key_from_hex(&key_hex)?;

@@ -1,4 +1,4 @@
-use super::{ObjectMeta, ObjectStore};
+use super::{require_secure_url, ObjectMeta, ObjectStore};
 use crate::{config::Endpoint, hashing, signing};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -7,13 +7,59 @@ use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use reqwest::{header::HeaderMap, Client, Method, StatusCode};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::{path::Path, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 
 type HmacSha256 = Hmac<Sha256>;
 
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// Maximum attempts (initial try + retries) for a transient S3 request failure.
+const MAX_ATTEMPTS: u32 = 5;
+
+/// Build the shared HTTP client with a connect timeout and an inactivity
+/// (read) timeout, so a stalled socket during a multi-hour, multi-gigabyte
+/// upload fails instead of hanging forever. The read timeout bounds silence
+/// between bytes, not total transfer time, so legitimate large streams are
+/// unaffected.
+fn build_client() -> Result<Client> {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(120))
+        .redirect(super::secure_redirect_policy())
+        .build()
+        .context("build s3 http client")
+}
+
+/// Retry only failures that a later attempt might succeed on: transport errors
+/// and 5xx / 429 / 408 responses. 4xx (auth, not-found, bad request) are not
+/// retried.
+fn retryable_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+}
+
+async fn retry_backoff(attempt: u32) {
+    // 200ms, 400ms, 800ms, ... capped at ~3.2s.
+    let ms = 200u64.saturating_mul(1u64 << attempt.min(4));
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
+/// Decide whether a send result should be returned or retried. Transport errors
+/// and retryable statuses are retried until `MAX_ATTEMPTS`; anything else
+/// (including non-retryable statuses such as 403/404) is returned so the caller
+/// can inspect it.
+fn classify(sent: reqwest::Result<reqwest::Response>, attempt: u32) -> RetryDecision {
+    let last = attempt + 1 >= MAX_ATTEMPTS;
+    match sent {
+        Ok(res) if retryable_status(res.status()) && !last => RetryDecision::Retry,
+        Ok(res) => RetryDecision::Return(Ok(res)),
+        Err(_) if !last => RetryDecision::Retry,
+        Err(err) => RetryDecision::Return(Err(err.into())),
+    }
+}
 
 /// Default size at which uploads transition to multipart. 64 MiB.
 pub const DEFAULT_MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
@@ -34,6 +80,11 @@ pub struct S3Store {
     secret_key: String,
     multipart_threshold: u64,
     multipart_part_size: u64,
+}
+
+enum RetryDecision {
+    Return(Result<reqwest::Response>),
+    Retry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,8 +122,9 @@ impl S3Store {
                 S3_MIN_PART_SIZE
             );
         }
+        require_secure_url(&endpoint)?;
         Ok(Self {
-            client: Client::new(),
+            client: build_client()?,
             endpoint: endpoint.trim_end_matches('/').to_string(),
             bucket,
             prefix: prefix.trim_matches('/').to_string(),
@@ -251,14 +303,30 @@ impl S3Store {
     ) -> Result<reqwest::Response> {
         let key = self.object_key(path)?;
         let canonical_query = query.unwrap_or("");
-        let headers =
-            self.signed_headers(&method, &key, canonical_query, EMPTY_SHA256, extra_headers)?;
-        Ok(self
-            .client
-            .request(method, self.url(&key, query))
-            .headers(headers)
-            .send()
-            .await?)
+        let mut attempt = 0;
+        loop {
+            // Re-sign every attempt: the signature covers `x-amz-date`.
+            let headers = self.signed_headers(
+                &method,
+                &key,
+                canonical_query,
+                EMPTY_SHA256,
+                extra_headers.clone(),
+            )?;
+            let sent = self
+                .client
+                .request(method.clone(), self.url(&key, query))
+                .headers(headers)
+                .send()
+                .await;
+            match classify(sent, attempt) {
+                RetryDecision::Return(res) => return res,
+                RetryDecision::Retry => {
+                    retry_backoff(attempt).await;
+                    attempt += 1;
+                }
+            }
+        }
     }
 
     async fn send_with_body(
@@ -271,41 +339,65 @@ impl S3Store {
     ) -> Result<reqwest::Response> {
         let key = self.object_key(path)?;
         let payload_hash = hashing::sha256_bytes(&bytes);
-        let headers = self.signed_headers(
-            &method,
-            &key,
-            query.unwrap_or(""),
-            &payload_hash,
-            extra_headers,
-        )?;
-        Ok(self
-            .client
-            .request(method, self.url(&key, query))
-            .headers(headers)
-            .body(bytes)
-            .send()
-            .await?)
+        let mut attempt = 0;
+        loop {
+            let headers = self.signed_headers(
+                &method,
+                &key,
+                query.unwrap_or(""),
+                &payload_hash,
+                extra_headers.clone(),
+            )?;
+            let sent = self
+                .client
+                .request(method.clone(), self.url(&key, query))
+                .headers(headers)
+                .body(bytes.clone())
+                .send()
+                .await;
+            match classify(sent, attempt) {
+                RetryDecision::Return(res) => return res,
+                RetryDecision::Retry => {
+                    retry_backoff(attempt).await;
+                    attempt += 1;
+                }
+            }
+        }
     }
 
     async fn put_file_single(&self, path: &str, source: &Path) -> Result<()> {
         let key = self.object_key(path)?;
         let payload_hash = hashing::hash_file(source)?.sha256;
-        let headers = self.signed_headers(&Method::PUT, &key, "", &payload_hash, Vec::new())?;
-        let file = tokio::fs::File::open(source).await?;
-        let size = file.metadata().await?.len();
-        let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
-        let res = self
-            .client
-            .put(self.url(&key, None))
-            .headers(headers)
-            .header(reqwest::header::CONTENT_LENGTH, size)
-            .body(body)
-            .send()
-            .await?;
-        if !res.status().is_success() {
-            bail!("s3 put file {path} failed with {}", res.status());
+        let mut attempt = 0;
+        loop {
+            // Reopen and re-sign on each attempt: the body is a one-shot stream
+            // and the signature covers `x-amz-date`.
+            let headers = self.signed_headers(&Method::PUT, &key, "", &payload_hash, Vec::new())?;
+            let file = tokio::fs::File::open(source).await?;
+            let size = file.metadata().await?.len();
+            let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
+            let sent = self
+                .client
+                .put(self.url(&key, None))
+                .headers(headers)
+                .header(reqwest::header::CONTENT_LENGTH, size)
+                .body(body)
+                .send()
+                .await;
+            match classify(sent, attempt) {
+                RetryDecision::Return(res) => {
+                    let res = res?;
+                    if !res.status().is_success() {
+                        bail!("s3 put file {path} failed with {}", res.status());
+                    }
+                    return Ok(());
+                }
+                RetryDecision::Retry => {
+                    retry_backoff(attempt).await;
+                    attempt += 1;
+                }
+            }
         }
-        Ok(())
     }
 
     async fn put_file_multipart(
@@ -473,42 +565,58 @@ impl S3Store {
 #[async_trait]
 impl ObjectStore for S3Store {
     async fn get(&self, path: &str) -> Result<Vec<u8>> {
-        let res = self
-            .send_empty(Method::GET, path, None, Vec::new())
-            .await
-            .with_context(|| format!("s3 get {path}"))?;
-        if !res.status().is_success() {
-            bail!("s3 get {path} failed with {}", res.status());
+        // send_empty retries the request up to the status; also retry a body
+        // transfer that fails partway (a reset mid-download).
+        let mut attempt = 0;
+        loop {
+            let res = self
+                .send_empty(Method::GET, path, None, Vec::new())
+                .await
+                .with_context(|| format!("s3 get {path}"))?;
+            if !res.status().is_success() {
+                bail!("s3 get {path} failed with {}", res.status());
+            }
+            match res.bytes().await {
+                Ok(bytes) => return Ok(bytes.to_vec()),
+                Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                    retry_backoff(attempt).await;
+                    attempt += 1;
+                }
+                Err(err) => {
+                    return Err(
+                        anyhow::Error::new(err).context(format!("s3 get {path} body transfer"))
+                    )
+                }
+            }
         }
-        Ok(res.bytes().await?.to_vec())
     }
 
     async fn get_to_file(&self, path: &str, destination: &Path) -> Result<()> {
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let res = self.send_empty(Method::GET, path, None, Vec::new()).await?;
-        if !res.status().is_success() {
-            bail!("s3 get {path} failed with {}", res.status());
+        // Retry the whole download: a reset partway through streaming the body
+        // recreates (truncates) the destination and starts the GET over.
+        let mut attempt = 0;
+        loop {
+            let res = self.send_empty(Method::GET, path, None, Vec::new()).await?;
+            if !res.status().is_success() {
+                bail!("s3 get {path} failed with {}", res.status());
+            }
+            match stream_response_to_file(res, destination).await {
+                Ok(()) => return Ok(()),
+                Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                    retry_backoff(attempt).await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err.context(format!("s3 get {path} body transfer"))),
+            }
         }
-        let mut file = tokio::fs::File::create(destination).await?;
-        let mut stream = res.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            file.write_all(&chunk?).await?;
-        }
-        Ok(())
     }
 
     async fn put(&self, path: &str, bytes: &[u8]) -> Result<()> {
-        let key = self.object_key(path)?;
-        let payload_hash = hashing::sha256_bytes(bytes);
-        let headers = self.signed_headers(&Method::PUT, &key, "", &payload_hash, Vec::new())?;
         let res = self
-            .client
-            .put(self.url(&key, None))
-            .headers(headers)
-            .body(bytes.to_vec())
-            .send()
+            .send_with_body(Method::PUT, path, bytes.to_vec(), None, Vec::new())
             .await?;
         if !res.status().is_success() {
             bail!("s3 put {path} failed with {}", res.status());
@@ -542,20 +650,14 @@ impl ObjectStore for S3Store {
             }
         }
         let from_key = self.object_key(from)?;
-        let to_key = self.object_key(to)?;
         let copy_source = format!("/{}/{}", self.bucket, from_key);
-        let headers = self.signed_headers(
-            &Method::PUT,
-            &to_key,
-            "",
-            EMPTY_SHA256,
-            vec![("x-amz-copy-source", encode_copy_source(&copy_source))],
-        )?;
         let res = self
-            .client
-            .put(self.url(&to_key, None))
-            .headers(headers)
-            .send()
+            .send_empty(
+                Method::PUT,
+                to,
+                None,
+                vec![("x-amz-copy-source", encode_copy_source(&copy_source))],
+            )
             .await?;
         if !res.status().is_success() {
             bail!("s3 copy {from} to {to} failed with {}", res.status());
@@ -664,6 +766,17 @@ impl ObjectStore for S3Store {
     }
 }
 
+/// Stream a response body into a freshly created (truncated) file.
+async fn stream_response_to_file(res: reqwest::Response, destination: &Path) -> Result<()> {
+    let mut file = tokio::fs::File::create(destination).await?;
+    let mut stream = res.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        file.write_all(&chunk?).await?;
+    }
+    file.flush().await?;
+    Ok(())
+}
+
 pub(crate) fn validate_object_path(path: &str) -> Result<()> {
     if path.starts_with('/') || path.split('/').any(|part| part == "..") {
         bail!("unsafe object path {path}");
@@ -685,7 +798,6 @@ fn encode_query_value(input: &str) -> String {
     percent_encode(input, true)
 }
 
-#[allow(dead_code)]
 fn encode_copy_source(input: &str) -> String {
     input
         .split('/')

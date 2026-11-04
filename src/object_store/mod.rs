@@ -3,11 +3,62 @@ pub mod http;
 pub mod s3;
 
 use crate::config::Endpoint;
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// Whether `host` is a loopback address or `localhost` (cleartext http is only
+/// tolerated for these).
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    // `Url::host_str` returns IPv6 hosts bracketed, e.g. `[::1]`, which
+    // `IpAddr::from_str` does not accept, so strip the brackets first.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// Reject remote endpoints that would send requests (and, for S3, the signed
+/// `Authorization` header) in cleartext. `https` is always accepted; `http` is
+/// accepted only for loopback hosts so local development and tests still work.
+pub(crate) fn require_secure_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("parse url {url}"))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if parsed.host_str().map(is_loopback_host).unwrap_or(false) => Ok(()),
+        "http" => bail!(
+            "refusing insecure http endpoint {url}: use https \
+             (http is permitted only for loopback hosts)"
+        ),
+        other => bail!("unsupported url scheme `{other}` in {url}"),
+    }
+}
+
+/// A redirect policy that refuses to follow a redirect to a non-secure
+/// destination (preventing an https→http downgrade mid-request), keeping the
+/// same loopback exception, and caps the redirect chain.
+pub(crate) fn secure_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.stop();
+        }
+        let url = attempt.url();
+        let secure = url.scheme() == "https"
+            || (url.scheme() == "http" && url.host_str().map(is_loopback_host).unwrap_or(false));
+        if secure {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectMeta {
@@ -19,15 +70,20 @@ pub struct ObjectMeta {
 
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    /// Small objects only (manifests, pointers, blob objects). Buffers the whole
+    /// object in memory; use [`get_to_file`](Self::get_to_file) for artifacts.
     async fn get(&self, path: &str) -> Result<Vec<u8>>;
+    /// Small objects only. Buffers `bytes` in memory; use
+    /// [`put_file`](Self::put_file) for artifacts.
     async fn put(&self, path: &str, bytes: &[u8]) -> Result<()>;
-    async fn get_to_file(&self, path: &str, destination: &Path) -> Result<()> {
-        tokio::fs::write(destination, self.get(path).await?).await?;
-        Ok(())
-    }
-    async fn put_file(&self, path: &str, source: &Path) -> Result<()> {
-        self.put(path, &tokio::fs::read(source).await?).await
-    }
+    /// Stream a (potentially multi-gigabyte) object to a file. Required rather
+    /// than defaulted so no backend silently buffers a whole artifact in RAM.
+    async fn get_to_file(&self, path: &str, destination: &Path) -> Result<()>;
+    /// Stream a (potentially multi-gigabyte) file to the object store. Required
+    /// rather than defaulted so no backend silently buffers a whole artifact.
+    async fn put_file(&self, path: &str, source: &Path) -> Result<()>;
+    /// Small objects only (server-side copy is capped at 5 GiB on most
+    /// providers). Large artifacts are uploaded directly to their final key.
     #[allow(dead_code)]
     async fn copy(&self, from: &str, to: &str) -> Result<()> {
         let bytes = self.get(from).await?;
@@ -42,7 +98,7 @@ pub trait ObjectStore: Send + Sync {
 pub fn from_endpoint(endpoint: &Endpoint) -> Result<Box<dyn ObjectStore>> {
     match endpoint {
         Endpoint::File { path, .. } => Ok(Box::new(file::FileStore::new(path))),
-        Endpoint::Https { base_url, .. } => Ok(Box::new(http::HttpStore::new(base_url))),
+        Endpoint::Https { base_url, .. } => Ok(Box::new(http::HttpStore::new(base_url)?)),
         Endpoint::S3 { .. } => Ok(Box::new(s3::S3Store::new(endpoint.clone())?)),
     }
 }
