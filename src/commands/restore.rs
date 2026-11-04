@@ -21,6 +21,20 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
     let trust = cfg.trusted_for_endpoint(source)?;
     let store = object_store::from_endpoint(source)?;
 
+    // Restore overwrites live node state, so for a remote source we fail closed:
+    // the pointer and manifest must carry a signature from a trusted key unless
+    // the operator explicitly passes --insecure. Local file sources are the
+    // operator's own disk and keep the softer "verify if trust/signature is
+    // present" behavior.
+    let require_sig = !source.is_local() && !args.insecure;
+    if require_sig && trust.is_empty() {
+        bail!(
+            "restoring from remote source `{}` requires at least one trusted_keys \
+             entry in the config; configure one or pass --insecure to override",
+            args.source
+        );
+    }
+
     let (manifest_path, pointer) = if let Some(path) = &args.manifest_path {
         (path.clone(), None)
     } else {
@@ -40,7 +54,7 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
         let ptr_bytes = store.get(&ptr_path).await?;
         let pointer: SignedPointer = serde_json::from_slice(&ptr_bytes)?;
         pointer.validate_schema()?;
-        if !trust.is_empty() {
+        if require_sig || !trust.is_empty() {
             pointer.verify_signature(&trust)?;
         }
         (pointer.body.manifest_path.clone(), Some(pointer))
@@ -50,7 +64,7 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
     let manifest_hash = hashing::sha256_bytes(&manifest_bytes);
     let manifest: SignedManifest = serde_json::from_slice(&manifest_bytes)?;
     manifest.validate_schema()?;
-    if !trust.is_empty() || manifest.signature.is_some() {
+    if require_sig || !trust.is_empty() || manifest.signature.is_some() {
         manifest.verify_signature(&trust)?;
     }
     if let Some(pointer) = &pointer {

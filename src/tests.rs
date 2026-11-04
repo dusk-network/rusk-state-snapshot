@@ -595,6 +595,7 @@ async fn restore_verifies_before_replacing_and_keeps_backup() {
         destination_profile: dest.clone(),
         manage_service: None,
         owner: None,
+        insecure: false,
     })
     .await
     .unwrap();
@@ -619,6 +620,7 @@ async fn restore_verifies_before_replacing_and_keeps_backup() {
         destination_profile: dest.clone(),
         manage_service: None,
         owner: None,
+        insecure: false,
     })
     .await
     .is_err());
@@ -850,6 +852,39 @@ async fn gc_fails_closed_when_a_reachable_manifest_is_unreadable() {
     assert!(
         orphan.exists(),
         "gc must not delete anything when it aborts"
+    );
+}
+
+#[tokio::test]
+async fn restore_refuses_remote_source_without_trusted_keys() {
+    // A remote (https) source with no trusted_keys must be refused before any
+    // state is touched, unless --insecure is passed.
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tmp.path().join("config.toml");
+    fs::write(
+        &cfg,
+        "[source.remote]\nkind='https'\nbase_url='https://example.invalid'\n",
+    )
+    .unwrap();
+    let err = commands::restore::run(RestoreArgs {
+        source: "remote".to_string(),
+        config: cfg,
+        latest: true,
+        monthly: None,
+        daily: None,
+        yearly: None,
+        pin: None,
+        manifest_path: None,
+        destination_profile: tmp.path().join("dest"),
+        manage_service: None,
+        owner: None,
+        insecure: false,
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("trusted_keys"),
+        "unexpected error: {err}"
     );
 }
 

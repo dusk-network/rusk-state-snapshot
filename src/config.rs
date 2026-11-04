@@ -102,6 +102,12 @@ impl Config {
 }
 
 impl Endpoint {
+    /// A local filesystem endpoint is the operator's own disk and is treated as
+    /// a trusted transport; remote endpoints are not.
+    pub fn is_local(&self) -> bool {
+        matches!(self, Endpoint::File { .. })
+    }
+
     pub fn trusted_keys(&self) -> &Vec<String> {
         match self {
             Endpoint::File { trusted_keys, .. }

@@ -7,7 +7,7 @@ use crate::{
     pointer::{pointer_path, PointerBody, SignedPointer, POINTER_FORMAT},
     signing,
 };
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 
 pub async fn run(args: PromoteArgs) -> Result<()> {
@@ -67,6 +67,13 @@ pub async fn run(args: PromoteArgs) -> Result<()> {
     if args.label == "latest" && args.update_previous {
         if let Some(prev) = read_existing_pointer(store.as_ref(), "v1/pointers/latest.json").await?
         {
+            // Don't launder tampered store content under the operator's key:
+            // verify the current latest pointer before re-signing its body as
+            // `previous`, whenever trust keys are configured.
+            if !trusted_manifest_keys.is_empty() {
+                prev.verify_signature(&trusted_manifest_keys)
+                    .context("verify existing latest pointer before deriving previous")?;
+            }
             let previous_body = PointerBody {
                 label: "previous".to_string(),
                 updated_at: Utc::now(),
@@ -121,5 +128,6 @@ async fn read_existing_pointer(
     }
     let bytes = store.get(path).await?;
     let pointer: SignedPointer = serde_json::from_slice(&bytes)?;
+    pointer.validate_schema()?;
     Ok(Some(pointer))
 }
