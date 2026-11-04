@@ -1483,10 +1483,14 @@ async fn mark_archive_manifest_reachable(
             archive.body.state_snapshot.manifest_path
         )
     })?;
-    if let Some((state_dir, _)) = archive.body.state_snapshot.manifest_path.rsplit_once('/') {
-        for artifact in state.body.artifacts {
-            marked.insert(format!("{state_dir}/{}", artifact.path));
-        }
+    let Some((state_dir, _)) = archive.body.state_snapshot.manifest_path.rsplit_once('/') else {
+        bail!(
+            "gc: state manifest path has no parent directory: {}",
+            archive.body.state_snapshot.manifest_path
+        );
+    };
+    for artifact in state.body.artifacts {
+        marked.insert(format!("{state_dir}/{}", artifact.path));
     }
     Ok(())
 }

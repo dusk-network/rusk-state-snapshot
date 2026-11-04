@@ -96,9 +96,10 @@ fn trust(seed: &str) -> std::collections::HashMap<String, signing::TrustKey> {
 }
 
 /// Write a valid signed pointer (referencing the manifest `pointer_body` names)
-/// to `path`. gc now requires objects under pointer prefixes to parse.
-fn write_signed_pointer(path: &std::path::Path) {
-    let body = pointer_body();
+/// to `path`, committing to `manifest_sha256` so gc's digest check passes.
+fn write_signed_pointer(path: &std::path::Path, manifest_sha256: &str) {
+    let mut body = pointer_body();
+    body.manifest_sha256 = manifest_sha256.to_string();
     let pointer = SignedPointer {
         signature: signing::sign_body(&body, "k1", SEED1).unwrap(),
         body,
@@ -107,16 +108,19 @@ fn write_signed_pointer(path: &std::path::Path) {
     fs::write(path, serde_json::to_vec_pretty(&pointer).unwrap()).unwrap();
 }
 
-/// Write the valid signed manifest that `pointer_body` references into `target`.
-fn write_referenced_manifest(target: &std::path::Path) {
+/// Write the valid signed manifest that `pointer_body` references into `target`,
+/// returning its sha256 (over the exact stored bytes) for the pointer to commit.
+fn write_referenced_manifest(target: &std::path::Path) -> String {
     let body = body();
     let manifest = SignedManifest {
         signature: Some(signing::sign_body(&body, "k1", SEED1).unwrap()),
         body,
     };
+    let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
     let path = target.join("v1/snapshots/full/h000000001-sr_22222222/manifest.json");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    hashing::sha256_bytes(&bytes)
 }
 
 fn dt(input: &str) -> DateTime<Utc> {
@@ -796,15 +800,24 @@ async fn gc_prunes_calendar_pointers_before_reachability() {
         ),
     )
     .unwrap();
-    write_referenced_manifest(&target);
+    let msha = write_referenced_manifest(&target);
     for day in 1..=6 {
-        write_signed_pointer(&target.join(format!("v1/calendar/daily/2026-05-0{day}.json")));
+        write_signed_pointer(
+            &target.join(format!("v1/calendar/daily/2026-05-0{day}.json")),
+            &msha,
+        );
     }
     for month in 1..=13 {
-        write_signed_pointer(&target.join(format!("v1/calendar/monthly/2026-{month:02}.json")));
+        write_signed_pointer(
+            &target.join(format!("v1/calendar/monthly/2026-{month:02}.json")),
+            &msha,
+        );
     }
     for year in 2024..=2026 {
-        write_signed_pointer(&target.join(format!("v1/calendar/yearly/{year}.json")));
+        write_signed_pointer(
+            &target.join(format!("v1/calendar/yearly/{year}.json")),
+            &msha,
+        );
     }
     let policy = tmp.path().join("retention.toml");
     fs::write(
@@ -867,7 +880,7 @@ async fn gc_fails_closed_when_a_reachable_manifest_is_unreadable() {
     // because deletion is deferred until marking succeeds, an aborted run must
     // leave it intact.
     let prunable = target.join("v1/calendar/daily/2026-05-01.json");
-    write_signed_pointer(&prunable);
+    write_signed_pointer(&prunable, ""); // pruned, so never read/marked
 
     let policy = tmp.path().join("retention.toml");
     fs::write(
@@ -914,7 +927,6 @@ async fn gc_aborts_on_a_schema_invalid_reachable_manifest() {
         ),
     )
     .unwrap();
-    write_signed_pointer(&target.join("v1/pointers/latest.json"));
     // Manifest with an empty artifact list (schema-invalid).
     let mut mbody = body();
     mbody.artifacts.clear();
@@ -922,9 +934,16 @@ async fn gc_aborts_on_a_schema_invalid_reachable_manifest() {
         signature: Some(signing::sign_body(&mbody, "k1", SEED1).unwrap()),
         body: mbody,
     };
+    let mbytes = serde_json::to_vec_pretty(&manifest).unwrap();
     let mpath = target.join("v1/snapshots/full/h000000001-sr_22222222/manifest.json");
     fs::create_dir_all(mpath.parent().unwrap()).unwrap();
-    fs::write(&mpath, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    fs::write(&mpath, &mbytes).unwrap();
+    // Pointer commits to the (invalid) manifest's digest so gc passes the digest
+    // check and reaches schema validation.
+    write_signed_pointer(
+        &target.join("v1/pointers/latest.json"),
+        &hashing::sha256_bytes(&mbytes),
+    );
     let policy = tmp.path().join("retention.toml");
     fs::write(
         &policy,
@@ -2131,9 +2150,16 @@ async fn gc_dry_run_excludes_simulated_pruned_pointers_from_reachability() {
     })
     .await
     .unwrap();
-    // Create extra daily calendar pointers older than what retention keeps.
+    // Create extra daily calendar pointers older than what retention keeps,
+    // each committing to the published manifest's digest.
+    let msha = hashing::sha256_bytes(
+        &fs::read(target.join("v1/snapshots/full/h000000001-sr_22222222/manifest.json")).unwrap(),
+    );
     for day in 1..=4 {
-        write_signed_pointer(&target.join(format!("v1/calendar/daily/2026-05-0{day}.json")));
+        write_signed_pointer(
+            &target.join(format!("v1/calendar/daily/2026-05-0{day}.json")),
+            &msha,
+        );
     }
     // Policy keeps only 2 dailies: the older 2 should appear as prunable.
     let policy = tmp.path().join("retention.toml");

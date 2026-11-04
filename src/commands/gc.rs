@@ -1,8 +1,8 @@
 use crate::{
-    archive_blob, cli::GcArgs, config::Config, manifest::SignedManifest, object_store,
+    archive_blob, cli::GcArgs, config::Config, hashing, manifest::SignedManifest, object_store,
     pointer::SignedPointer, retention::RetentionPolicy,
 };
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
@@ -68,6 +68,11 @@ pub async fn run(args: GcArgs) -> Result<()> {
                     meta.path
                 )
             })?;
+            // Validate the pointer (constrains its manifest_path) before trusting
+            // the reference it hands us.
+            pointer
+                .validate_schema()
+                .with_context(|| format!("gc: invalid pointer {}", meta.path))?;
             marked.insert(pointer.body.manifest_path.clone());
             // From here fail closed: a valid pointer's manifest MUST resolve. A
             // transient read error or a corrupt manifest would otherwise leave a
@@ -82,6 +87,18 @@ pub async fn run(args: GcArgs) -> Result<()> {
                             pointer.body.manifest_path, meta.path
                         )
                     })?;
+            // Bind the manifest to the pointer: its bytes must match the digest
+            // the pointer committed to, or a substituted manifest could redirect
+            // reachability.
+            let digest = hashing::sha256_bytes(&manifest_bytes);
+            if digest != pointer.body.manifest_sha256 {
+                bail!(
+                    "gc: manifest {} digest {digest} does not match pointer {} ({})",
+                    pointer.body.manifest_path,
+                    meta.path,
+                    pointer.body.manifest_sha256
+                );
+            }
             let manifest: SignedManifest = serde_json::from_slice(&manifest_bytes)
                 .with_context(|| format!("gc: parse manifest {}", pointer.body.manifest_path))?;
             // Validate the schema before trusting its artifact list: a manifest
