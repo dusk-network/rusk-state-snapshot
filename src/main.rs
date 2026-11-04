@@ -1,3 +1,8 @@
+// `async_trait` expands to functions carrying an explicit `#[must_use]` on a
+// return type that is already `#[must_use]`, which trips `double_must_use`.
+// The lint fires only inside macro-generated code, so allow it crate-wide.
+#![allow(clippy::double_must_use)]
+
 mod archive;
 mod archive_blob;
 mod cli;

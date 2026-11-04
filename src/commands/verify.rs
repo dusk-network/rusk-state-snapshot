@@ -24,7 +24,12 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
 
 async fn verify_remote(args: VerifyArgs) -> Result<()> {
     let manifest_url = args.manifest.clone();
-    let manifest_res = reqwest::get(&manifest_url).await?;
+    crate::object_store::require_secure_url(&manifest_url)?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(120))
+        .build()?;
+    let manifest_res = client.get(&manifest_url).send().await?;
     if !manifest_res.status().is_success() {
         bail!("fetch {manifest_url} failed with {}", manifest_res.status());
     }
@@ -47,7 +52,7 @@ async fn verify_remote(args: VerifyArgs) -> Result<()> {
     // Stream the artifact to a temp file rather than buffering the entire
     // archive in memory. Production artifacts can be many gigabytes.
     let artifact_path = tmp.path().join(&artifact.path);
-    let res = reqwest::get(&artifact_url).await?;
+    let res = client.get(&artifact_url).send().await?;
     if !res.status().is_success() {
         bail!("fetch {artifact_url} failed with {}", res.status());
     }

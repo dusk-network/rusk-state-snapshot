@@ -1,13 +1,14 @@
-use super::{ObjectMeta, ObjectStore};
-use anyhow::{bail, Result};
+use super::{require_secure_url, ObjectMeta, ObjectStore};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::Deserialize;
-use std::path::Path;
+use std::{path::Path, time::Duration};
 use tokio::io::AsyncWriteExt;
 
 pub struct HttpStore {
     base_url: String,
+    client: reqwest::Client,
 }
 
 #[derive(Debug, Deserialize)]
@@ -17,10 +18,17 @@ struct HttpIndex {
 }
 
 impl HttpStore {
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-        }
+    pub fn new(base_url: impl Into<String>) -> Result<Self> {
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+        require_secure_url(&base_url)?;
+        Ok(Self {
+            base_url,
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(30))
+                .read_timeout(Duration::from_secs(120))
+                .build()
+                .context("build http client")?,
+        })
     }
 
     fn url(&self, path: &str) -> Result<String> {
@@ -39,7 +47,7 @@ impl HttpStore {
 #[async_trait]
 impl ObjectStore for HttpStore {
     async fn get(&self, path: &str) -> Result<Vec<u8>> {
-        let res = reqwest::get(self.url(path)?).await?;
+        let res = self.client.get(self.url(path)?).send().await?;
         if !res.status().is_success() {
             bail!("http get {path} failed with {}", res.status());
         }
@@ -50,7 +58,7 @@ impl ObjectStore for HttpStore {
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let res = reqwest::get(self.url(path)?).await?;
+        let res = self.client.get(self.url(path)?).send().await?;
         if !res.status().is_success() {
             bail!("http get {path} failed with {}", res.status());
         }
@@ -66,8 +74,12 @@ impl ObjectStore for HttpStore {
         bail!("http source is read-only")
     }
 
+    async fn put_file(&self, _path: &str, _source: &Path) -> Result<()> {
+        bail!("http source is read-only")
+    }
+
     async fn stat(&self, path: &str) -> Result<Option<ObjectMeta>> {
-        let res = reqwest::Client::new().head(self.url(path)?).send().await?;
+        let res = self.client.head(self.url(path)?).send().await?;
         if res.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
