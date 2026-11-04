@@ -794,6 +794,65 @@ async fn gc_prunes_calendar_pointers_before_reachability() {
     assert!(target.join("v1/calendar/yearly/2026.json").exists());
 }
 
+#[tokio::test]
+async fn gc_fails_closed_when_a_reachable_manifest_is_unreadable() {
+    // A valid pointer references a manifest that is missing from the store.
+    // GC must abort rather than treat the pointer's snapshot as unreachable and
+    // delete a real (but here unrelated) artifact.
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("target");
+    let cfg = tmp.path().join("config.toml");
+    fs::write(
+        &cfg,
+        format!(
+            "[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\nsigning_key_id='target-k1'\n",
+            target.display(),
+            SEED1
+        ),
+    )
+    .unwrap();
+
+    // Valid latest pointer -> manifest that we never write.
+    let body = pointer_body();
+    let pointer = SignedPointer {
+        signature: signing::sign_body(&body, "k1", SEED1).unwrap(),
+        body,
+    };
+    let ptr_path = target.join("v1/pointers/latest.json");
+    fs::create_dir_all(ptr_path.parent().unwrap()).unwrap();
+    fs::write(&ptr_path, serde_json::to_vec_pretty(&pointer).unwrap()).unwrap();
+
+    // An unrelated, unreferenced, old-enough artifact that a buggy GC would
+    // delete after silently under-marking the pointer above.
+    let orphan = target.join("v1/snapshots/full/h000000002-sr_33333333/snapshot.tar.gz");
+    fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    fs::write(&orphan, b"artifact").unwrap();
+
+    let policy = tmp.path().join("retention.toml");
+    fs::write(
+        &policy,
+        "[rolling]\nkeep_latest=true\nkeep_previous=true\nkeep_daily=5\n[monthly]\nkeep_months=12\nselection='last-good-daily-of-month'\n[yearly]\nkeep_years=1\nselection='december-monthly'\n[gc]\ndelete_grace_period='0s'\ndry_run_default=true\n",
+    )
+    .unwrap();
+
+    let result = commands::gc::run(GcArgs {
+        target: "local".to_string(),
+        config: cfg,
+        policy,
+        dry_run: false,
+        delete: true,
+    })
+    .await;
+    assert!(
+        result.is_err(),
+        "gc should fail closed on an unreadable manifest"
+    );
+    assert!(
+        orphan.exists(),
+        "gc must not delete anything when it aborts"
+    );
+}
+
 #[test]
 fn retention_duration_parses() {
     assert_eq!(retention::parse_duration("7d").unwrap().as_secs(), 604800);

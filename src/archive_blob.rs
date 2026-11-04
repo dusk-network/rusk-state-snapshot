@@ -1382,9 +1382,14 @@ pub async fn mark_archive_blob_reachable(
                 continue;
             }
             marked.insert(meta.path.clone());
-            let Ok(bytes) = store.get(&meta.path).await else {
-                continue;
-            };
+            // A transient read error on a listed rooted pointer aborts GC
+            // (fail closed).
+            let bytes = store
+                .get(&meta.path)
+                .await
+                .with_context(|| format!("gc: read archive pointer {}", meta.path))?;
+            // Objects that are not valid rooted archive pointers reference
+            // nothing; skip them rather than abort.
             let Ok(pointer) = serde_json::from_slice::<SignedArchivePointer>(&bytes) else {
                 continue;
             };
@@ -1403,27 +1408,40 @@ async fn mark_archive_manifest_reachable(
     manifest_path: &str,
 ) -> Result<()> {
     marked.insert(manifest_path.to_string());
-    let Ok(bytes) = store.get(manifest_path).await else {
-        return Ok(());
-    };
-    let Ok(archive) = serde_json::from_slice::<SignedArchiveManifest>(&bytes) else {
-        return Ok(());
-    };
+    // Fail closed: a rooted archive manifest that cannot be read or parsed must
+    // abort GC, not silently leave its (and its state snapshot's) artifacts
+    // unmarked and therefore deletable.
+    let bytes = store
+        .get(manifest_path)
+        .await
+        .with_context(|| format!("gc: read archive manifest {manifest_path}"))?;
+    let archive: SignedArchiveManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("gc: parse archive manifest {manifest_path}"))?;
     let Some((archive_dir, _)) = manifest_path.rsplit_once('/') else {
-        return Ok(());
+        bail!("gc: archive manifest path has no parent directory: {manifest_path}");
     };
     for artifact in &archive.body.artifacts {
         marked.insert(format!("{archive_dir}/{}", artifact.path));
     }
     marked.insert(archive.body.state_snapshot.manifest_path.clone());
-    if let Ok(state_bytes) = store.get(&archive.body.state_snapshot.manifest_path).await {
-        if let Ok(state) = serde_json::from_slice::<SignedManifest>(&state_bytes) {
-            if let Some((state_dir, _)) = archive.body.state_snapshot.manifest_path.rsplit_once('/')
-            {
-                for artifact in state.body.artifacts {
-                    marked.insert(format!("{state_dir}/{}", artifact.path));
-                }
-            }
+    let state_bytes = store
+        .get(&archive.body.state_snapshot.manifest_path)
+        .await
+        .with_context(|| {
+            format!(
+                "gc: read state manifest {} referenced by archive {manifest_path}",
+                archive.body.state_snapshot.manifest_path
+            )
+        })?;
+    let state: SignedManifest = serde_json::from_slice(&state_bytes).with_context(|| {
+        format!(
+            "gc: parse state manifest {}",
+            archive.body.state_snapshot.manifest_path
+        )
+    })?;
+    if let Some((state_dir, _)) = archive.body.state_snapshot.manifest_path.rsplit_once('/') {
+        for artifact in state.body.artifacts {
+            marked.insert(format!("{state_dir}/{}", artifact.path));
         }
     }
     Ok(())

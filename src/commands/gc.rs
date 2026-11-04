@@ -2,7 +2,7 @@ use crate::{
     archive_blob, cli::GcArgs, config::Config, manifest::SignedManifest, object_store,
     pointer::SignedPointer, retention::RetentionPolicy,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
@@ -58,18 +58,38 @@ pub async fn run(args: GcArgs) -> Result<()> {
                 continue;
             }
             marked.insert(meta.path.clone());
-            let bytes = store.get(&meta.path).await?;
-            if let Ok(pointer) = serde_json::from_slice::<SignedPointer>(&bytes) {
-                marked.insert(pointer.body.manifest_path.clone());
-                if let Ok(manifest_bytes) = store.get(&pointer.body.manifest_path).await {
-                    if let Ok(manifest) = serde_json::from_slice::<SignedManifest>(&manifest_bytes)
-                    {
-                        if let Some((dir, _)) = pointer.body.manifest_path.rsplit_once('/') {
-                            for artifact in manifest.body.artifacts {
-                                marked.insert(format!("{dir}/{}", artifact.path));
-                            }
-                        }
-                    }
+            // A transient read error on a listed pointer aborts GC rather than
+            // silently under-marking (fail closed).
+            let bytes = store
+                .get(&meta.path)
+                .await
+                .with_context(|| format!("gc: read pointer {}", meta.path))?;
+            // Objects under the pointer prefixes that are not valid pointers
+            // (e.g. opaque calendar markers) reference nothing and contribute no
+            // reachability, so skip them. Real pointers are valid JSON written
+            // atomically.
+            let Ok(pointer) = serde_json::from_slice::<SignedPointer>(&bytes) else {
+                continue;
+            };
+            marked.insert(pointer.body.manifest_path.clone());
+            // From here fail closed: a valid pointer's manifest MUST resolve. A
+            // transient read error or a corrupt manifest would otherwise leave a
+            // live snapshot's artifacts unmarked and deletable under `--delete`.
+            let manifest_bytes =
+                store
+                    .get(&pointer.body.manifest_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "gc: read manifest {} referenced by pointer {}",
+                            pointer.body.manifest_path, meta.path
+                        )
+                    })?;
+            let manifest: SignedManifest = serde_json::from_slice(&manifest_bytes)
+                .with_context(|| format!("gc: parse manifest {}", pointer.body.manifest_path))?;
+            if let Some((dir, _)) = pointer.body.manifest_path.rsplit_once('/') {
+                for artifact in manifest.body.artifacts {
+                    marked.insert(format!("{dir}/{}", artifact.path));
                 }
             }
         }
@@ -83,6 +103,9 @@ pub async fn run(args: GcArgs) -> Result<()> {
             if marked.contains(&meta.path) {
                 continue;
             }
+            // Retain when the modified time is unknown: deleting an object we
+            // cannot age-check could remove something still within its grace
+            // period. Better to keep (possible garbage) than risk data loss.
             let old_enough = meta
                 .modified
                 .and_then(|m| {
@@ -90,7 +113,7 @@ pub async fn run(args: GcArgs) -> Result<()> {
                     now.duration_since(st).ok()
                 })
                 .map(|age| age >= grace)
-                .unwrap_or(true);
+                .unwrap_or(false);
             if old_enough {
                 deletable.push(meta.path);
             }
