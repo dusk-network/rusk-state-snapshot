@@ -180,6 +180,7 @@ pub async fn pack_stopped_candidate_with_service(
 
     record_event(events, "stop");
     service.stop(service_name).await?;
+    let stopped_at = std::time::Instant::now();
 
     let packed = async {
         record_event(events, "read-stopped-tip");
@@ -209,12 +210,20 @@ pub async fn pack_stopped_candidate_with_service(
         Ok(candidate) => {
             record_event(events, "start");
             service.start(service_name).await?;
+            eprintln!(
+                "{service_name} stopped for {:.1}s to pack the snapshot",
+                stopped_at.elapsed().as_secs_f64()
+            );
             Ok(candidate)
         }
         Err(err) => {
             if !args.leave_stopped_on_error {
                 record_event(events, "start");
                 let _ = service.start(service_name).await;
+                eprintln!(
+                    "{service_name} stopped for {:.1}s before the pack failed",
+                    stopped_at.elapsed().as_secs_f64()
+                );
             }
             Err(err)
         }
@@ -520,13 +529,14 @@ fn pack_candidate_files(
     }
 
     let state_id = archive::read_state_id(&args.state_dir)?;
-    archive::create_snapshot_archive(
+    // Hashes are computed as the archive is written, so the node stays stopped
+    // only for the compression pass, not an additional full read-back.
+    let hashes = archive::create_snapshot_archive(
         &args.state_dir,
         &args.chain_db_dir,
         &artifact_tmp,
         args.compression,
     )?;
-    sync_file(&artifact_tmp)?;
     fs::rename(&artifact_tmp, &artifact_path).with_context(|| {
         format!(
             "rename {} to {}",
@@ -536,7 +546,6 @@ fn pack_candidate_files(
     })?;
     sync_dir(&candidate_dir);
 
-    let hashes = hashing::hash_file(&artifact_path)?;
     let key_id = args
         .manifest_key_id
         .clone()
@@ -636,13 +645,6 @@ fn write_atomic(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<()> {
     fs::rename(tmp, path)
         .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))?;
     Ok(())
-}
-
-fn sync_file(path: &Path) -> Result<()> {
-    File::open(path)
-        .with_context(|| format!("open {}", path.display()))?
-        .sync_all()
-        .with_context(|| format!("fsync {}", path.display()))
 }
 
 fn sync_dir(path: &Path) {

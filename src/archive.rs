@@ -1,3 +1,4 @@
+use crate::hashing::{Hashes, HashingWriter};
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 use flate2::{write::GzEncoder, Compression};
@@ -39,35 +40,41 @@ impl SnapshotCompression {
     }
 }
 
+/// Create the snapshot archive and return its hashes, computed over the
+/// compressed bytes as they are written. Hashing during creation avoids a
+/// second full read of a multi-gigabyte artifact while the node is stopped.
 pub fn create_snapshot_archive(
     state_dir: &Path,
     chain_db_dir: &Path,
     out: &Path,
     compression: SnapshotCompression,
-) -> Result<()> {
+) -> Result<Hashes> {
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
     }
     let file = File::create(out).with_context(|| format!("create {}", out.display()))?;
-    match compression {
+    // HashingWriter wraps the file (outside the encoder) so the hashes cover the
+    // exact compressed bytes written to disk.
+    let hashing = HashingWriter::new(file);
+    let (file, hashes) = match compression {
         SnapshotCompression::Gzip => {
-            let encoder = GzEncoder::new(file, Compression::default());
+            let encoder = GzEncoder::new(hashing, Compression::default());
             let mut tar = Builder::new(encoder);
             append_dir_stable(&mut tar, state_dir, "state")?;
             append_dir_stable(&mut tar, chain_db_dir, "chain.db")?;
-            let encoder = tar.into_inner()?;
-            encoder.finish()?;
+            tar.into_inner()?.finish()?.finish()
         }
         SnapshotCompression::Zstd => {
-            let encoder = zstd::Encoder::new(file, 3)?;
+            let encoder = zstd::Encoder::new(hashing, 3)?;
             let mut tar = Builder::new(encoder);
             append_dir_stable(&mut tar, state_dir, "state")?;
             append_dir_stable(&mut tar, chain_db_dir, "chain.db")?;
-            let encoder = tar.into_inner()?;
-            encoder.finish()?;
+            tar.into_inner()?.finish()?.finish()
         }
-    }
-    Ok(())
+    };
+    file.sync_all()
+        .with_context(|| format!("fsync {}", out.display()))?;
+    Ok(hashes)
 }
 
 fn append_dir_stable<W: std::io::Write>(
