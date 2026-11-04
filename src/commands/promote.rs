@@ -69,9 +69,21 @@ pub async fn run(args: PromoteArgs) -> Result<()> {
         {
             // Don't launder tampered store content under the operator's key:
             // verify the current latest pointer before re-signing its body as
-            // `previous`, whenever trust keys are configured.
-            if !trusted_manifest_keys.is_empty() {
-                prev.verify_signature(&trusted_manifest_keys)
+            // `previous`. Pointers are signed with the target key id, which may
+            // not be among the manifest trusted_keys, so verify against the
+            // target's own public key plus any configured (rotation) trust keys.
+            let mut verify_keys = trusted_manifest_keys.clone();
+            if let Ok(public_key) = signing::public_key_from_secret_spec(key_spec) {
+                verify_keys.insert(
+                    key_id.to_string(),
+                    signing::TrustKey {
+                        scheme: "ed25519".to_string(),
+                        public_key,
+                    },
+                );
+            }
+            if !verify_keys.is_empty() {
+                prev.verify_signature(&verify_keys)
                     .context("verify existing latest pointer before deriving previous")?;
             }
             let previous_body = PointerBody {

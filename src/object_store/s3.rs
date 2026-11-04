@@ -27,6 +27,7 @@ fn build_client() -> Result<Client> {
     Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs(120))
+        .redirect(super::secure_redirect_policy())
         .build()
         .context("build s3 http client")
 }
@@ -564,30 +565,53 @@ impl S3Store {
 #[async_trait]
 impl ObjectStore for S3Store {
     async fn get(&self, path: &str) -> Result<Vec<u8>> {
-        let res = self
-            .send_empty(Method::GET, path, None, Vec::new())
-            .await
-            .with_context(|| format!("s3 get {path}"))?;
-        if !res.status().is_success() {
-            bail!("s3 get {path} failed with {}", res.status());
+        // send_empty retries the request up to the status; also retry a body
+        // transfer that fails partway (a reset mid-download).
+        let mut attempt = 0;
+        loop {
+            let res = self
+                .send_empty(Method::GET, path, None, Vec::new())
+                .await
+                .with_context(|| format!("s3 get {path}"))?;
+            if !res.status().is_success() {
+                bail!("s3 get {path} failed with {}", res.status());
+            }
+            match res.bytes().await {
+                Ok(bytes) => return Ok(bytes.to_vec()),
+                Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                    retry_backoff(attempt).await;
+                    attempt += 1;
+                }
+                Err(err) => {
+                    return Err(
+                        anyhow::Error::new(err).context(format!("s3 get {path} body transfer"))
+                    )
+                }
+            }
         }
-        Ok(res.bytes().await?.to_vec())
     }
 
     async fn get_to_file(&self, path: &str, destination: &Path) -> Result<()> {
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let res = self.send_empty(Method::GET, path, None, Vec::new()).await?;
-        if !res.status().is_success() {
-            bail!("s3 get {path} failed with {}", res.status());
+        // Retry the whole download: a reset partway through streaming the body
+        // recreates (truncates) the destination and starts the GET over.
+        let mut attempt = 0;
+        loop {
+            let res = self.send_empty(Method::GET, path, None, Vec::new()).await?;
+            if !res.status().is_success() {
+                bail!("s3 get {path} failed with {}", res.status());
+            }
+            match stream_response_to_file(res, destination).await {
+                Ok(()) => return Ok(()),
+                Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                    retry_backoff(attempt).await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err.context(format!("s3 get {path} body transfer"))),
+            }
         }
-        let mut file = tokio::fs::File::create(destination).await?;
-        let mut stream = res.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            file.write_all(&chunk?).await?;
-        }
-        Ok(())
     }
 
     async fn put(&self, path: &str, bytes: &[u8]) -> Result<()> {
@@ -740,6 +764,17 @@ impl ObjectStore for S3Store {
         }
         Ok(())
     }
+}
+
+/// Stream a response body into a freshly created (truncated) file.
+async fn stream_response_to_file(res: reqwest::Response, destination: &Path) -> Result<()> {
+    let mut file = tokio::fs::File::create(destination).await?;
+    let mut stream = res.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        file.write_all(&chunk?).await?;
+    }
+    file.flush().await?;
+    Ok(())
 }
 
 pub(crate) fn validate_object_path(path: &str) -> Result<()> {

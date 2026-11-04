@@ -58,19 +58,21 @@ pub async fn run(args: GcArgs) -> Result<()> {
                 continue;
             }
             marked.insert(meta.path.clone());
-            // A transient read error on a listed pointer aborts GC rather than
-            // silently under-marking (fail closed).
+            // Fail closed: a read OR parse error on a listed pointer aborts GC
+            // rather than silently under-marking. A corrupt-but-real pointer
+            // would otherwise be skipped, leaving its snapshot deletable. (All
+            // pointers the tool writes are valid JSON; there is no opaque-marker
+            // format under these prefixes.)
             let bytes = store
                 .get(&meta.path)
                 .await
                 .with_context(|| format!("gc: read pointer {}", meta.path))?;
-            // Objects under the pointer prefixes that are not valid pointers
-            // (e.g. opaque calendar markers) reference nothing and contribute no
-            // reachability, so skip them. Real pointers are valid JSON written
-            // atomically.
-            let Ok(pointer) = serde_json::from_slice::<SignedPointer>(&bytes) else {
-                continue;
-            };
+            let pointer: SignedPointer = serde_json::from_slice(&bytes).with_context(|| {
+                format!(
+                    "gc: parse pointer {}; refusing to GC with an unreadable pointer",
+                    meta.path
+                )
+            })?;
             marked.insert(pointer.body.manifest_path.clone());
             // From here fail closed: a valid pointer's manifest MUST resolve. A
             // transient read error or a corrupt manifest would otherwise leave a

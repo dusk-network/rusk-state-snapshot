@@ -9,6 +9,16 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Whether `host` is a loopback address or `localhost` (cleartext http is only
+/// tolerated for these).
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
 /// Reject remote endpoints that would send requests (and, for S3, the signed
 /// `Authorization` header) in cleartext. `https` is always accepted; `http` is
 /// accepted only for loopback hosts so local development and tests still work.
@@ -16,24 +26,32 @@ pub(crate) fn require_secure_url(url: &str) -> Result<()> {
     let parsed = reqwest::Url::parse(url).with_context(|| format!("parse url {url}"))?;
     match parsed.scheme() {
         "https" => Ok(()),
-        "http" => {
-            let host = parsed.host_str().unwrap_or("");
-            let loopback = host == "localhost"
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .map(|ip| ip.is_loopback())
-                    .unwrap_or(false);
-            if loopback {
-                Ok(())
-            } else {
-                bail!(
-                    "refusing insecure http endpoint {url}: use https \
-                     (http is permitted only for loopback hosts)"
-                )
-            }
-        }
+        "http" if parsed.host_str().map(is_loopback_host).unwrap_or(false) => Ok(()),
+        "http" => bail!(
+            "refusing insecure http endpoint {url}: use https \
+             (http is permitted only for loopback hosts)"
+        ),
         other => bail!("unsupported url scheme `{other}` in {url}"),
     }
+}
+
+/// A redirect policy that refuses to follow a redirect to a non-secure
+/// destination (preventing an https→http downgrade mid-request), keeping the
+/// same loopback exception, and caps the redirect chain.
+pub(crate) fn secure_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.stop();
+        }
+        let url = attempt.url();
+        let secure = url.scheme() == "https"
+            || (url.scheme() == "http" && url.host_str().map(is_loopback_host).unwrap_or(false));
+        if secure {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -16,48 +16,20 @@ pub struct TrustKey {
     pub public_key: String,
 }
 
-/// Serialize `value` to a canonical JSON byte string: object keys sorted, no
-/// insignificant whitespace. Signatures are computed over this form, so the
-/// result must be stable across runs and independent of struct field order or
-/// map backing (e.g. a future `HashMap` field would otherwise serialize in a
-/// nondeterministic order and break verification).
+/// Serialize `value` to the byte string signatures are computed over.
+///
+/// This is `serde_json`'s default serialization, which is deterministic for the
+/// signed bodies because they are composed only of scalars and ordered `Vec`s
+/// (serde emits struct fields in declaration order). It is deliberately NOT a
+/// re-sorting canonicalizer: changing the byte representation would invalidate
+/// every already-signed v1 manifest and pointer without a format version bump.
+///
+/// Invariant: signed bodies must not contain a `HashMap`/`BTreeMap` or
+/// `#[serde(flatten)]`ed map, whose serialization order is not guaranteed. The
+/// current bodies satisfy this; `signed_body_serializes_in_declaration_order`
+/// guards the representation against an accidental re-sort or reorder.
 pub fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let value = serde_json::to_value(value)?;
-    let mut out = Vec::new();
-    write_canonical(&value, &mut out)?;
-    Ok(out)
-}
-
-fn write_canonical(value: &serde_json::Value, out: &mut Vec<u8>) -> Result<()> {
-    use serde_json::Value;
-    match value {
-        Value::Object(map) => {
-            out.push(b'{');
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            for (i, key) in keys.into_iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                serde_json::to_writer(&mut *out, key)?;
-                out.push(b':');
-                write_canonical(&map[key], out)?;
-            }
-            out.push(b'}');
-        }
-        Value::Array(items) => {
-            out.push(b'[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                write_canonical(item, out)?;
-            }
-            out.push(b']');
-        }
-        scalar => serde_json::to_writer(&mut *out, scalar)?,
-    }
-    Ok(())
+    Ok(serde_json::to_vec(value)?)
 }
 
 pub fn sign_body<T: Serialize>(body: &T, key_id: &str, key_spec: &str) -> Result<SignatureBlock> {
@@ -89,7 +61,6 @@ pub fn verify_body<T: Serialize>(
         .map_err(|_| anyhow!("signature verification failed"))
 }
 
-#[allow(dead_code)]
 pub fn public_key_from_secret_spec(key_spec: &str) -> Result<String> {
     let key_hex = resolve_secret_spec(key_spec)?;
     let sk = secret_key_from_hex(&key_hex)?;

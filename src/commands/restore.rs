@@ -54,7 +54,10 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
         let ptr_bytes = store.get(&ptr_path).await?;
         let pointer: SignedPointer = serde_json::from_slice(&ptr_bytes)?;
         pointer.validate_schema()?;
-        if require_sig || !trust.is_empty() {
+        // --insecure cleanly bypasses signature trust (hash/schema/state.id
+        // checks below still run); otherwise verify when required or when trust
+        // keys are configured.
+        if !args.insecure && (require_sig || !trust.is_empty()) {
             pointer.verify_signature(&trust)?;
         }
         (pointer.body.manifest_path.clone(), Some(pointer))
@@ -64,7 +67,7 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
     let manifest_hash = hashing::sha256_bytes(&manifest_bytes);
     let manifest: SignedManifest = serde_json::from_slice(&manifest_bytes)?;
     manifest.validate_schema()?;
-    if require_sig || !trust.is_empty() || manifest.signature.is_some() {
+    if !args.insecure && (require_sig || !trust.is_empty() || manifest.signature.is_some()) {
         manifest.verify_signature(&trust)?;
     }
     if let Some(pointer) = &pointer {

@@ -28,6 +28,7 @@ async fn verify_remote(args: VerifyArgs) -> Result<()> {
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_secs(120))
+        .redirect(crate::object_store::secure_redirect_policy())
         .build()?;
     let manifest_res = client.get(&manifest_url).send().await?;
     if !manifest_res.status().is_success() {

@@ -269,6 +269,9 @@ pub struct ArchiveBlobVerifyOptions {
     pub require_signed_blob_coverage: bool,
     pub require_signed_archive: bool,
     pub require_signed_archive_pointers: bool,
+    /// Bypass all signature trust checks (the `--insecure` escape hatch).
+    /// Schema, hash, completeness, and KZG proof validation still run.
+    pub insecure: bool,
 }
 
 impl From<&ArchiveBlobConfig> for ArchiveBlobVerifyOptions {
@@ -278,6 +281,7 @@ impl From<&ArchiveBlobConfig> for ArchiveBlobVerifyOptions {
             require_signed_blob_coverage: config.require_signed_blob_coverage,
             require_signed_archive: config.require_signed_archive,
             require_signed_archive_pointers: config.require_signed_archive_pointers,
+            insecure: false,
         }
     }
 }
@@ -1027,7 +1031,7 @@ pub async fn promote_archive_manifest_with_options(
     if verify.require_signed_archive {
         require_present_signature(&archive.signature, "archive manifest")?;
         archive.verify_signature(trust)?;
-    } else if archive.signature.is_some() || !trust.is_empty() {
+    } else if !verify.insecure && (archive.signature.is_some() || !trust.is_empty()) {
         archive.verify_signature(trust)?;
     }
     let manifest_sha256 = hashing::sha256_bytes(&bytes);
@@ -1119,7 +1123,9 @@ pub async fn verify_blob_coverage_with_options(
     if verify.require_signed_blob_coverage {
         require_present_signature(&coverage.signature, "blob coverage")?;
     }
-    coverage.verify_signature(trust)?;
+    if !verify.insecure {
+        coverage.verify_signature(trust)?;
+    }
     if coverage.body.from_height != from_height {
         bail!(
             "coverage starts at {}, expected {from_height}",
@@ -1168,7 +1174,9 @@ pub async fn verify_archive_complete_with_options(
     if verify.require_signed_archive {
         require_present_signature(&archive.signature, "archive manifest")?;
     }
-    archive.verify_signature(trust)?;
+    if !verify.insecure {
+        archive.verify_signature(trust)?;
+    }
     let archive_dir = archive_manifest_path
         .rsplit_once('/')
         .map(|(dir, _)| dir)
@@ -1213,7 +1221,9 @@ pub async fn verify_archive_complete_with_options(
     if verify.require_signed_blob_coverage {
         require_present_signature(&coverage.signature, "blob coverage")?;
     }
-    coverage.verify_signature(trust)?;
+    if !verify.insecure {
+        coverage.verify_signature(trust)?;
+    }
     if coverage.body.network != archive.body.network {
         bail!("blob coverage network does not match archive network");
     }
@@ -1382,20 +1392,17 @@ pub async fn mark_archive_blob_reachable(
                 continue;
             }
             marked.insert(meta.path.clone());
-            // A transient read error on a listed rooted pointer aborts GC
-            // (fail closed).
+            // Fail closed: a read, parse, or schema error on a listed rooted
+            // pointer aborts GC rather than silently under-marking.
             let bytes = store
                 .get(&meta.path)
                 .await
                 .with_context(|| format!("gc: read archive pointer {}", meta.path))?;
-            // Objects that are not valid rooted archive pointers reference
-            // nothing; skip them rather than abort.
-            let Ok(pointer) = serde_json::from_slice::<SignedArchivePointer>(&bytes) else {
-                continue;
-            };
-            if pointer.validate_schema().is_err() {
-                continue;
-            }
+            let pointer: SignedArchivePointer = serde_json::from_slice(&bytes)
+                .with_context(|| format!("gc: parse archive pointer {}", meta.path))?;
+            pointer
+                .validate_schema()
+                .with_context(|| format!("gc: invalid archive pointer {}", meta.path))?;
             mark_archive_manifest_reachable(store, marked, &pointer.body.manifest_path).await?;
         }
     }
@@ -1647,6 +1654,9 @@ fn is_forbidden_archive_input(path: &Path) -> bool {
         || lower.contains("signing")
         || lower.contains("consensus")
         || lower.contains(".keys")
+        // Any `keys` path component (archive creation filters entries
+        // individually, so excluding the dir does not exclude its children).
+        || lower.contains("/keys/")
         || lower.ends_with("/keys")
         || lower.starts_with("keys/")
         || lower == "keys"

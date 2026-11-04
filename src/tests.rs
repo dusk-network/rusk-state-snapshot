@@ -95,6 +95,30 @@ fn trust(seed: &str) -> std::collections::HashMap<String, signing::TrustKey> {
     map
 }
 
+/// Write a valid signed pointer (referencing the manifest `pointer_body` names)
+/// to `path`. gc now requires objects under pointer prefixes to parse.
+fn write_signed_pointer(path: &std::path::Path) {
+    let body = pointer_body();
+    let pointer = SignedPointer {
+        signature: signing::sign_body(&body, "k1", SEED1).unwrap(),
+        body,
+    };
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, serde_json::to_vec_pretty(&pointer).unwrap()).unwrap();
+}
+
+/// Write the valid signed manifest that `pointer_body` references into `target`.
+fn write_referenced_manifest(target: &std::path::Path) {
+    let body = body();
+    let manifest = SignedManifest {
+        signature: Some(signing::sign_body(&body, "k1", SEED1).unwrap()),
+        body,
+    };
+    let path = target.join("v1/snapshots/full/h000000001-sr_22222222/manifest.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
 fn dt(input: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(input)
         .unwrap()
@@ -370,10 +394,17 @@ fn pointer_signature_verifies_and_rejects_tamper() {
 }
 
 #[test]
-fn canonical_json_sorts_object_keys() {
-    let value = serde_json::json!({"b": 1, "a": {"z": 2, "y": 3}, "c": [3, 1]});
-    let out = signing::canonical_json(&value).unwrap();
-    assert_eq!(out, br#"{"a":{"y":3,"z":2},"b":1,"c":[3,1]}"#);
+fn signed_body_serializes_in_declaration_order() {
+    // The signed representation must stay in struct declaration order, not be
+    // re-sorted: changing the bytes would invalidate every already-signed v1
+    // manifest/pointer. This locks that (a re-sort would put "artifacts" first).
+    let bytes = signing::canonical_json(&body()).unwrap();
+    let s = std::str::from_utf8(&bytes).unwrap();
+    assert!(s.starts_with(r#"{"format":"#), "got: {s}");
+    let pos = |k: &str| s.find(k).unwrap();
+    assert!(pos("\"network\":") < pos("\"role\":"));
+    assert!(pos("\"role\":") < pos("\"height\":"));
+    assert!(pos("\"height\":") < pos("\"artifacts\":"));
 }
 
 #[tokio::test]
@@ -765,20 +796,15 @@ async fn gc_prunes_calendar_pointers_before_reachability() {
         ),
     )
     .unwrap();
+    write_referenced_manifest(&target);
     for day in 1..=6 {
-        let path = target.join(format!("v1/calendar/daily/2026-05-0{day}.json"));
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, b"{}").unwrap();
+        write_signed_pointer(&target.join(format!("v1/calendar/daily/2026-05-0{day}.json")));
     }
     for month in 1..=13 {
-        let path = target.join(format!("v1/calendar/monthly/2026-{month:02}.json"));
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, b"{}").unwrap();
+        write_signed_pointer(&target.join(format!("v1/calendar/monthly/2026-{month:02}.json")));
     }
     for year in 2024..=2026 {
-        let path = target.join(format!("v1/calendar/yearly/{year}.json"));
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, b"{}").unwrap();
+        write_signed_pointer(&target.join(format!("v1/calendar/yearly/{year}.json")));
     }
     let policy = tmp.path().join("retention.toml");
     fs::write(
@@ -892,6 +918,39 @@ async fn restore_refuses_remote_source_without_trusted_keys() {
     assert!(
         err.to_string().contains("trusted_keys"),
         "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn restore_insecure_bypasses_the_remote_trust_gate() {
+    // With --insecure, the remote trust gate must not fire; restore proceeds
+    // (and here fails later on the unreachable host, not on trusted_keys).
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tmp.path().join("config.toml");
+    fs::write(
+        &cfg,
+        "[source.remote]\nkind='https'\nbase_url='https://nonexistent.invalid'\n",
+    )
+    .unwrap();
+    let err = commands::restore::run(RestoreArgs {
+        source: "remote".to_string(),
+        config: cfg,
+        latest: true,
+        monthly: None,
+        daily: None,
+        yearly: None,
+        pin: None,
+        manifest_path: None,
+        destination_profile: tmp.path().join("dest"),
+        manage_service: None,
+        owner: None,
+        insecure: true,
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        !err.to_string().contains("trusted_keys"),
+        "insecure should bypass the trust gate, got: {err}"
     );
 }
 
@@ -2006,9 +2065,7 @@ async fn gc_dry_run_excludes_simulated_pruned_pointers_from_reachability() {
     .unwrap();
     // Create extra daily calendar pointers older than what retention keeps.
     for day in 1..=4 {
-        let path = target.join(format!("v1/calendar/daily/2026-05-0{day}.json"));
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, b"{}").unwrap();
+        write_signed_pointer(&target.join(format!("v1/calendar/daily/2026-05-0{day}.json")));
     }
     // Policy keeps only 2 dailies: the older 2 should appear as prunable.
     let policy = tmp.path().join("retention.toml");

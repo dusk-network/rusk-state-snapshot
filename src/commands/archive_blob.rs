@@ -183,7 +183,14 @@ pub async fn archive_restore_complete(args: ArchiveRestoreCompleteArgs) -> Resul
     // Archive restore overwrites node state, so fail closed for remote sources:
     // require trusted signatures on the archive, blob ranges, coverage, and
     // pointers unless the operator passes --insecure.
-    if !source.is_local() && !args.insecure {
+    if args.insecure {
+        // Clean bypass of signature trust; schema/hash/completeness/KZG still run.
+        verify.insecure = true;
+        verify.require_signed_blob_ranges = false;
+        verify.require_signed_blob_coverage = false;
+        verify.require_signed_archive = false;
+        verify.require_signed_archive_pointers = false;
+    } else if !source.is_local() {
         if trust.is_empty() {
             bail!(
                 "restoring an archive from remote source `{}` requires at least one \

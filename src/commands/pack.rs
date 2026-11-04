@@ -1,7 +1,6 @@
 use crate::{
     archive,
     cli::PackArgs,
-    hashing,
     manifest::{
         snapshot_id, Artifact, ComponentEntry, Components, ManifestBody, Publisher, SignedManifest,
         MANIFEST_FORMAT,
@@ -19,13 +18,13 @@ pub async fn run(args: PackArgs) -> Result<()> {
     fs::create_dir_all(&candidate_dir)?;
     let artifact_name = args.compression.artifact_path();
     let archive_path = candidate_dir.join(artifact_name);
-    archive::create_snapshot_archive(
+    // Hashes are computed during archive creation; don't read the artifact back.
+    let hashes = archive::create_snapshot_archive(
         &args.state_dir,
         &args.chain_db_dir,
         &archive_path,
         args.compression,
     )?;
-    let hashes = hashing::hash_file(&archive_path)?;
 
     let key_id = args
         .key_id

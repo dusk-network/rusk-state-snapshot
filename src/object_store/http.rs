@@ -26,6 +26,7 @@ impl HttpStore {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(30))
                 .read_timeout(Duration::from_secs(120))
+                .redirect(super::secure_redirect_policy())
                 .build()
                 .context("build http client")?,
         })
