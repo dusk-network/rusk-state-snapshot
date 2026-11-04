@@ -1160,13 +1160,13 @@ pub async fn verify_archive_complete(
     .await
 }
 
-pub async fn verify_archive_complete_with_options(
+async fn verify_archive_complete_inner(
     store: &dyn ObjectStore,
     archive_manifest_path: &str,
     target_height: u64,
     trust: &HashMap<String, TrustKey>,
     verify: ArchiveBlobVerifyOptions,
-) -> Result<ArchiveCompleteness> {
+) -> Result<VerifiedArchive> {
     validate_object_path(archive_manifest_path)?;
     let archive_bytes = store.get(archive_manifest_path).await?;
     let archive: SignedArchiveManifest = serde_json::from_slice(&archive_bytes)?;
@@ -1240,14 +1240,42 @@ pub async fn verify_archive_complete_with_options(
     if proof.block_hashes.get(&archive.body.height) != Some(&archive.body.block_hash) {
         bail!("blob coverage block hash at archive height does not match archive checkpoint");
     }
-    Ok(ArchiveCompleteness {
+    let completeness = ArchiveCompleteness {
         archive_manifest_path: archive_manifest_path.to_string(),
         archive_height: archive.body.height,
         target_height,
-        state_manifest_path: archive.body.state_snapshot.manifest_path,
-        blob_coverage_path: archive.body.blob_coverage.coverage_manifest_path,
+        state_manifest_path: archive.body.state_snapshot.manifest_path.clone(),
+        blob_coverage_path: archive.body.blob_coverage.coverage_manifest_path.clone(),
         blob_objects: proof.blob_objects,
+    };
+    Ok(VerifiedArchive {
+        completeness,
+        archive,
+        state_manifest,
     })
+}
+
+/// A fully verified archive checkpoint plus the authenticated manifests behind
+/// it, so restore installs from the already-verified bytes instead of
+/// re-fetching (which a remote could substitute).
+struct VerifiedArchive {
+    completeness: ArchiveCompleteness,
+    archive: SignedArchiveManifest,
+    state_manifest: SignedManifest,
+}
+
+pub async fn verify_archive_complete_with_options(
+    store: &dyn ObjectStore,
+    archive_manifest_path: &str,
+    target_height: u64,
+    trust: &HashMap<String, TrustKey>,
+    verify: ArchiveBlobVerifyOptions,
+) -> Result<ArchiveCompleteness> {
+    Ok(
+        verify_archive_complete_inner(store, archive_manifest_path, target_height, trust, verify)
+            .await?
+            .completeness,
+    )
 }
 
 #[allow(dead_code)]
@@ -1279,7 +1307,13 @@ pub async fn restore_archive_complete_with_options(
     store: &dyn ObjectStore,
     opts: RestoreArchiveOptions<'_>,
 ) -> Result<ArchiveRestoreProof> {
-    let completeness = verify_archive_complete_with_options(
+    // Install from the manifests verify authenticated, not a fresh fetch a
+    // remote could substitute between verification and installation.
+    let VerifiedArchive {
+        completeness,
+        archive,
+        state_manifest,
+    } = verify_archive_complete_inner(
         store,
         opts.archive_manifest_path,
         opts.target_height,
@@ -1287,12 +1321,6 @@ pub async fn restore_archive_complete_with_options(
         opts.verify,
     )
     .await?;
-    let archive_bytes = store.get(opts.archive_manifest_path).await?;
-    let archive: SignedArchiveManifest = serde_json::from_slice(&archive_bytes)?;
-    let state_bytes = store
-        .get(&archive.body.state_snapshot.manifest_path)
-        .await?;
-    let state_manifest: SignedManifest = serde_json::from_slice(&state_bytes)?;
 
     let temp_parent = opts
         .destination_profile
@@ -1424,6 +1452,9 @@ async fn mark_archive_manifest_reachable(
         .with_context(|| format!("gc: read archive manifest {manifest_path}"))?;
     let archive: SignedArchiveManifest = serde_json::from_slice(&bytes)
         .with_context(|| format!("gc: parse archive manifest {manifest_path}"))?;
+    archive
+        .validate_schema()
+        .with_context(|| format!("gc: invalid archive manifest {manifest_path}"))?;
     let Some((archive_dir, _)) = manifest_path.rsplit_once('/') else {
         bail!("gc: archive manifest path has no parent directory: {manifest_path}");
     };
@@ -1443,6 +1474,12 @@ async fn mark_archive_manifest_reachable(
     let state: SignedManifest = serde_json::from_slice(&state_bytes).with_context(|| {
         format!(
             "gc: parse state manifest {}",
+            archive.body.state_snapshot.manifest_path
+        )
+    })?;
+    state.validate_schema().with_context(|| {
+        format!(
+            "gc: invalid state manifest {}",
             archive.body.state_snapshot.manifest_path
         )
     })?;

@@ -863,10 +863,16 @@ async fn gc_fails_closed_when_a_reachable_manifest_is_unreadable() {
     fs::create_dir_all(orphan.parent().unwrap()).unwrap();
     fs::write(&orphan, b"artifact").unwrap();
 
+    // A prunable daily pointer: with keep_daily=0 retention would delete it, but
+    // because deletion is deferred until marking succeeds, an aborted run must
+    // leave it intact.
+    let prunable = target.join("v1/calendar/daily/2026-05-01.json");
+    write_signed_pointer(&prunable);
+
     let policy = tmp.path().join("retention.toml");
     fs::write(
         &policy,
-        "[rolling]\nkeep_latest=true\nkeep_previous=true\nkeep_daily=5\n[monthly]\nkeep_months=12\nselection='last-good-daily-of-month'\n[yearly]\nkeep_years=1\nselection='december-monthly'\n[gc]\ndelete_grace_period='0s'\ndry_run_default=true\n",
+        "[rolling]\nkeep_latest=true\nkeep_previous=true\nkeep_daily=0\n[monthly]\nkeep_months=12\nselection='last-good-daily-of-month'\n[yearly]\nkeep_years=1\nselection='december-monthly'\n[gc]\ndelete_grace_period='0s'\ndry_run_default=true\n",
     )
     .unwrap();
 
@@ -886,6 +892,68 @@ async fn gc_fails_closed_when_a_reachable_manifest_is_unreadable() {
         orphan.exists(),
         "gc must not delete anything when it aborts"
     );
+    assert!(
+        prunable.exists(),
+        "a failed mark phase must not have deleted the prunable pointer"
+    );
+}
+
+#[tokio::test]
+async fn gc_aborts_on_a_schema_invalid_reachable_manifest() {
+    // A reachable manifest tampered to have no artifacts parses but fails schema
+    // validation; GC must abort rather than mark nothing and sweep the snapshot.
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("target");
+    let cfg = tmp.path().join("config.toml");
+    fs::write(
+        &cfg,
+        format!(
+            "[target.local]\nkind='file'\npath='{}'\nsigning_key='{}'\nsigning_key_id='target-k1'\n",
+            target.display(),
+            SEED1
+        ),
+    )
+    .unwrap();
+    write_signed_pointer(&target.join("v1/pointers/latest.json"));
+    // Manifest with an empty artifact list (schema-invalid).
+    let mut mbody = body();
+    mbody.artifacts.clear();
+    let manifest = SignedManifest {
+        signature: Some(signing::sign_body(&mbody, "k1", SEED1).unwrap()),
+        body: mbody,
+    };
+    let mpath = target.join("v1/snapshots/full/h000000001-sr_22222222/manifest.json");
+    fs::create_dir_all(mpath.parent().unwrap()).unwrap();
+    fs::write(&mpath, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    let policy = tmp.path().join("retention.toml");
+    fs::write(
+        &policy,
+        "[rolling]\nkeep_latest=true\nkeep_previous=true\nkeep_daily=5\n[monthly]\nkeep_months=12\nselection='last-good-daily-of-month'\n[yearly]\nkeep_years=1\nselection='december-monthly'\n[gc]\ndelete_grace_period='0s'\ndry_run_default=true\n",
+    )
+    .unwrap();
+    let result = commands::gc::run(GcArgs {
+        target: "local".to_string(),
+        config: cfg,
+        policy,
+        dry_run: false,
+        delete: true,
+    })
+    .await;
+    assert!(
+        result.is_err(),
+        "gc should abort on a schema-invalid manifest"
+    );
+}
+
+#[test]
+fn ipv6_loopback_host_is_recognized() {
+    use crate::object_store::is_loopback_host;
+    assert!(is_loopback_host("[::1]"));
+    assert!(is_loopback_host("::1"));
+    assert!(is_loopback_host("127.0.0.1"));
+    assert!(is_loopback_host("localhost"));
+    assert!(!is_loopback_host("example.com"));
+    assert!(!is_loopback_host("[2001:db8::1]"));
 }
 
 #[tokio::test]

@@ -27,16 +27,11 @@ pub async fn run(args: GcArgs) -> Result<()> {
     // a dry run regardless of whether --dry-run was passed.
     let dry_run = !args.delete;
 
-    // Compute the set of pointers that retention would prune. On a real run
-    // we delete them up-front. On a dry run we DON'T delete, but we still
-    // exclude them from reachability marking so the report accurately
-    // reflects what `--delete` would later remove.
+    // Compute (but do NOT yet delete) the pointers retention would prune, and
+    // exclude them from reachability marking so the report reflects what a real
+    // run would remove. Nothing is deleted until marking and sweep planning
+    // fully succeed, so an abort mid-marking leaves the store untouched.
     let prunable_pointers = simulate_prune_pointers(store.as_ref(), &policy).await?;
-    if !dry_run {
-        for path in &prunable_pointers {
-            store.delete(path).await?;
-        }
-    }
     let pruned: HashSet<&str> = prunable_pointers.iter().map(|s| s.as_str()).collect();
 
     let mut marked = HashSet::new();
@@ -89,6 +84,12 @@ pub async fn run(args: GcArgs) -> Result<()> {
                     })?;
             let manifest: SignedManifest = serde_json::from_slice(&manifest_bytes)
                 .with_context(|| format!("gc: parse manifest {}", pointer.body.manifest_path))?;
+            // Validate the schema before trusting its artifact list: a manifest
+            // tampered to `artifacts: []` would otherwise mark nothing and leave
+            // its real artifact deletable.
+            manifest
+                .validate_schema()
+                .with_context(|| format!("gc: invalid manifest {}", pointer.body.manifest_path))?;
             if let Some((dir, _)) = pointer.body.manifest_path.rsplit_once('/') {
                 for artifact in manifest.body.artifacts {
                     marked.insert(format!("{dir}/{}", artifact.path));
@@ -124,6 +125,12 @@ pub async fn run(args: GcArgs) -> Result<()> {
     deletable.sort();
     let mut deleted = Vec::new();
     if !dry_run {
+        // Only now, after marking and sweep planning have succeeded, do we
+        // mutate the store: prune the retention pointers, then delete the
+        // unreferenced objects.
+        for path in &prunable_pointers {
+            store.delete(path).await?;
+        }
         for path in &deletable {
             store.delete(path).await?;
             deleted.push(path.clone());

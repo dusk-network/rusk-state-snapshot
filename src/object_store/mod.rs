@@ -12,6 +12,12 @@ use std::path::Path;
 /// Whether `host` is a loopback address or `localhost` (cleartext http is only
 /// tolerated for these).
 pub(crate) fn is_loopback_host(host: &str) -> bool {
+    // `Url::host_str` returns IPv6 hosts bracketed, e.g. `[::1]`, which
+    // `IpAddr::from_str` does not accept, so strip the brackets first.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     host == "localhost"
         || host
             .parse::<std::net::IpAddr>()
